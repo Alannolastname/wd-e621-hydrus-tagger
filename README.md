@@ -6,11 +6,13 @@ If the root folder (the folder this .md file is in) has moved or has been rename
 The original requirements for this tool called for either python 3.9.x or 3.10.x. However, I have gotten it to build in it's current form on python 3.11 (pip 22.3). As such, I recommend using python 3.11 to build. You should NOT use python 3.12 as it has removed distutils, which is necessary for some of the dependencies and I don't know how I'd go about fixing everything that has broken. Sorry. Anyways:
 
 * Python 3.11.x
+* Git 2.45.2 or later
 * Hydrus Network with API key
 * A willingness to google stuff when things go wrong
 
+
 ## FOR FIRST TIME INSTALLATION:
-1. Open root folder (folder with this .md file) in cmd and run "python -m venv venv" without quotes
+1. Open the root folder (folder with this .md file) in cmd and run "python -m venv venv" without quotes
 2. Run start.bat in your command line to open the venv
 3. Type "pip install -r requirements.txt" and press enter
 
@@ -55,25 +57,32 @@ There are 4 .bat files, start.bat, e621.bat, wd.bat, and ratings.bat. start.bat 
 	- e. Click "copy api access key"
 	- f. now paste the access key from your clipboard to the .bat file
 3. (optional) If necessary, replace "A.I. Tags" with the name of your tag service (keep the quotes)
-4. (optional) Review if you're capable of using your GPU for AI work. In my personal case I am not, but if you can, you can try changing "--cpu 1" to "--cpu 0". If you can't it should default to CPU processing anyways, giving you an ugly but ignorable error.
-5. Save your changes
-6. Repeat steps 2 through 5 with e621.bat and ratings.bat
+4. Save your changes
+5. Repeat steps 2 through 4 with e621.bat and ratings.bat
 
+# Now you should be prepared and ready to start automatically tagging files. 
+I recommend starting with a single file or a small group of files, and testing wd.bat, e621.bat, and ratings.bat individually. Make sure the tags are being put into your AI tagging service, that tag siblings/parents are displaying correctly, and that the file is properly tagged as being AI tagged. If all is well, you can proceed to mass tagging.
 
-## COMPLETELY OPTIONAL CONVENIENCE CHANGE:
+## (OPTIONAL) CONVENIENCE CHANGE:
 1. In the folder this .md file is in, navigate to venv\Scripts\
 2. Open activate.bat in a text editor
 3. At the bottom of the file, add "cmd /k" to a new line
    
 You can now double-click start.bat to automatically open the venv.
 
+## (OPTIONAL) ENABLING GPU USE:
+The program does not have GPU utilization capability by default due to the necessary files having to be sourced from elsewhere. To enable GPU use for windows installations:
+1. Install [CUDA 11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive). You only need the runtime libraries, and you can uncheck the other install options. Alternatively, just do the express installation.
+2. add "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin" to your Windows PATH environment variable. There are several guides online on how to do this, it isn't that hard.
+3. download the [cuDNN 8.9.2 for CUDA 11.x](https://developer.nvidia.com/rdp/cudnn-archive) windows archive, and extract it to a safe location. I recommend putting the folders from the archive in "C:\Program Files\NVIDIA\CUDNN\v8.9.2", as this matches where Nvidia installs cuDNN when installed through an automatic installer.
+4. add "C:\Program Files\NVIDIA\CUDNN\v8.9.2\bin" to your Windows PATH environment variable.
+5. Download [zlib123dllx64.zip](https://forums.developer.nvidia.com/uploads/short-url/e76PYqafTHaGM1XQhQumCSL4vqb.zip) and extract the files to a temporary location
+6. copy zlibwapi.dll from inside the dll_x64 folder, and place it inside the "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin" folder.
 
-# Now you should be prepared and ready to start automatically tagging files. 
-I recommend starting with a single file, and testing wd.bat, e621.bat, and ratings.bat individually. Make sure the tags are being put into your AI tagging service, that tag siblings/parents are displaying correctly, and that the file is properly tagged as being AI tagged. If all is well, you can proceed to mass tagging.
-
+With all this done, you should be able to utilize the GPU when tagging. To enable GPU utilization, set the CPU option to 0. I recommend testing just as you would on a first install, with a small amount of test hashes. There's chance of an error, but from my experience this doesn't necessarily mean the GPU isn't being utilized. Really, just take the ETA time when CPU is set to 1 and compare to when it's set to 0, and see if it's noticeably faster. If so, then the GPU is being utilized.
 
 ## FOR NORMAL USE:
-1. Open command line and type start.bat or double-click if able
+1. Open command line in the root folder and type start.bat or double-click if the convenience change has been made
 2. With Hydrus OPEN:
 	- a. Copy a list of sha256 hashes from Hydrus (right click on file, navigate to share > copy > hash/hashes > sha256)
 	- b. Paste list into hashes.txt
@@ -90,7 +99,7 @@ python -m wd-hydrus-tagger evaluate /path/to/file
 #### Options:
 ```
   --cpu BOOLEAN      Use CPU instead of GPU
-  --model TEXT       The tagging model to use
+  --model TEXT       The tagging model folder to use
   --threshold FLOAT  The threshhold to drop tags below
 ```
 
@@ -102,7 +111,7 @@ python -m wd-hydrus-tagger evaluate-api --token your_hydrus_token 123_your_files
 ```
   --token TEXT        The API token for your Hydrus server
   --cpu BOOLEAN       Use CPU instead of GPU
-  --model TEXT        The tagging model to use
+  --model TEXT        The tagging model folder to use
   --threshold FLOAT   The threshhold to drop tags below
   --host TEXT         The URL for your Hydrus server
   --tag-service TEXT  The tag service to send tags that match the threshold to
@@ -120,7 +129,7 @@ Where hashes.txt is a file containing one Hydrus file hash per line.
 ```
   --token TEXT        The API token for your Hydrus server
   --cpu BOOLEAN       Use CPU instead of GPU
-  --model TEXT        The tagging model to use
+  --model TEXT        The tagging model folder to use
   --threshold FLOAT   The threshhold to drop tags below
   --host TEXT         The URL for your Hydrus server
   --tag-service TEXT  The tag service to send tags that match the threshold to
@@ -129,7 +138,7 @@ Where hashes.txt is a file containing one Hydrus file hash per line.
 ```
 
 ## RANDOM INFO:
-Everything has been edited to work on a Windows 10 Pro installation. Your mileage may vary on other operating systems.
+Everything has been confirmed to work on various Windows 10 installations. I've also read about other people getting everything (except GPU utilization) working on various linux distributions by changing the .bat files.
 If you do run into problems on other operating systems, the culprit is likely in interrogate.py, specifically where path() is invoked or it's something to do with the .bat files and how they're written.
 
 e621.bat uses an e621 model that doesn't tag content ratings but should provide much more accurate tags for furry artwork. For example, where an anthropomorphic dragon would be tagged "demon girl" by the WD tagger, e621 will properly recognize it as an anthropomorphic dragon and tag it as such.
@@ -154,9 +163,11 @@ You can have each .bat send the tags to their own personal tag service if you'd 
 
 As of the latest version of this tagging tool, the way that the "ai generated tags" tags are made is different, meaning they very likely wont match the tags given to already processed files. I recommend sibling-ing the previous tag to the newly created one, or vice versa.
 
-Ages ago I tried setting up the required tools to utilize my GPU for tagging. Unfortunately I've forgotten most of the steps to accomplish this, but what I remembered involved installing software outside the venv from nvidia. I also remember that it's not possible to include the software with the venv via requirements.txt. The results were actually pretty good, I went from processing 2048 files in 2 hours to doing 8192 in about the same amount of time. Of course, my GPU sounded like a jet engine the entire time, so I don't really recommend it if you plan to run it all night. 
-
 Python 3.12 seems to have severely broken some of the dependencies used by this tool. Perhaps with enough fiddling and changing required package versions it might work, but it's much easier to just use python 3.11. python 3.10 might also work, but I believe the latest version of onnxruntime as well as a couple other packages that were updated require atleast python 3.11.
+
+I tested and confirmed that cuDNN 8.9.7 also works without issue, however as the onnxruntime documentation specifically calls for cuDNN 8.9.2, it's what i've listed in the setup instructions.
+
+I've read that "zlibwapi.dll" often exists elsewhere in windows installations, including in Nvidia Nsight installations (renamed to zlib.dll). I don't know if these would work, but they might do the trick if you can't/don't want to download the file separately. 
 
 YOU MUST REBUILD THE VENV IF YOU MOVE OR RENAME THIS FOLDER
 
@@ -164,4 +175,5 @@ YOU MUST REBUILD THE VENV IF YOU MOVE OR RENAME THIS FOLDER
 - SmilingWolf for the WD tagging models as well as some simple code to detect Kaomojis. (https://huggingface.co/SmilingWolf)
 - Abtalerico for the well made original tool that I poorly edited to make this. (https://github.com/abtalerico/wd-hydrus-tagger) (deleted, copy can be found at  https://github.com/Garbevoir/wd-e621-hydrus-tagger/tree/main)
 - Zack3d (furzacky) for the E621 tagging model. (https://discord.com/channels/754509198674362388/1065785788698218526) (https://discord.gg/BDFpq9Yb7K)
+- This moderator on the Nvidia developer forums for providing safe downloads for zlibwapi.dll. (https://forums.developer.nvidia.com/t/could-not-load-library-cudnn-cnn-infer64-8-dll-error-code-193/218437/16)
 - Hydrus Dev for developing and improving hydrus nonstop for several years, the real G.O.A.T. (https://hydrusnetwork.github.io/hydrus/index.html)
