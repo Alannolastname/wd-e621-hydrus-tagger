@@ -86,17 +86,18 @@ To enable GPU use for *wd-v3* SmilingWolf models, such as [wd-eva02-large-tagger
 
 > [!WARNING] 
 > This was tested with Python 3.11.9; CUDA 12.6.3; cuDNN 9.5.1; onnxruntime-gpu 1.20.1
+>
 > If you willing to test it with other 12.x CUDA and 9.x cuDNN installations please refer to [onnxruntime dependencies table](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements)
 
 - Install [CUDA Toolkit 12.6.3](https://developer.nvidia.com/cuda-toolkit-archive); as said above, you only need runtime libraries, so please uncheck other install options if you want to reduce the size of installation.
 - Check if CUDA installer properly added binaries to your Windows PATH:
-	  - `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin` 
-	  - and `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\libnvvp`
+	- `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin`
+  	- and `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\libnvvp`
 - Install [cuDNN 9.5.1](https://developer.nvidia.com/cudnn-archive); by default cuDNN install libraries for both CUDA 11.8 and CUDA 12.6, you can uncheck 11.8 if you don't need it.
 	- **VERY IMPORTANT!** The installer automatically adds only `\bin\` folder to your Windows PATH which is incorrect!
 	- To make it correct you need to edit the Windows PATH variable to according to CUDA version you are using, so it should look like this `C:\Program Files\NVIDIA\CUDNN\v9.5\bin\12.6` please **double check** this PATH to avoid issues.
 - Additionally make sure that you have all possible **Visual C++ Redistributables** installed on your system, decent source for all-in-one package can be found [here](https://github.com/abbodi1406/vcredist) if you don't want to install each one of them manually.
-- After you make sure that PATH variables are correct you can utilize your GPU for tagging. If you followed the initial preparation/setup steps correctly — refer to the instructions below on how to add different models. Once you edit your wd.bat to use `--cpu 0` it should automatically install latest onnxruntime-gpu to your venv on the first run.
+- After you make sure that PATH variables are correct you can utilize your GPU for tagging. If you followed the initial preparation/setup steps correctly — refer to the instructions below on how to add different models. Once you edited your wd.bat to use `--cpu 0` it should automatically install latest onnxruntime-gpu to your venv on the first run.
 
 ## FOR NORMAL USE:
 1. Open command line in the root folder and type start.bat or double-click if the convenience change has been made
