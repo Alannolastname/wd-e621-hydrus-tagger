@@ -81,6 +81,24 @@ The program does not have GPU utilization capability by default due to the neces
 
 With all this done, you should be able to utilize the GPU when tagging. To enable GPU utilization, set the CPU option to 0. I recommend testing just as you would on a first install, with a small amount of test hashes. There's chance of an error, but from my experience this doesn't necessarily mean the GPU isn't being utilized. Really, just take the ETA time when CPU is set to 1 and compare to when it's set to 0, and see if it's noticeably faster. If so, then the GPU is being utilized.
 
+### Additional note on enabling GPU use with latest tagging models
+To enable GPU use for *wd-v3* SmilingWolf models, such as [wd-eva02-large-tagger-v3](https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3) or [wd-swinv2-tagger-v3](https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3) you will need to use updated versions of CUDA (12.x) and cuDNN (9.x).
+
+> [!WARNING] 
+> This was tested with Python 3.11.9; CUDA 12.6.3; cuDNN 9.5.1; onnxruntime-gpu 1.20.1
+>
+> If you willing to test it with other 12.x CUDA and 9.x cuDNN installations please refer to [onnxruntime dependencies table](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements)
+
+- Install [CUDA Toolkit 12.6.3](https://developer.nvidia.com/cuda-toolkit-archive); as said above, you only need runtime libraries, so please uncheck other install options if you want to reduce the size of installation.
+- Check if CUDA installer properly added binaries to your Windows PATH:
+	- `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin`
+  	- and `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\libnvvp`
+- Install [cuDNN 9.5.1](https://developer.nvidia.com/cudnn-archive); by default cuDNN install libraries for both CUDA 11.8 and CUDA 12.6, you can uncheck 11.8 if you don't need it.
+	- **VERY IMPORTANT!** The installer automatically adds only `\bin\` folder to your Windows PATH which is incorrect!
+	- To make it correct you need to edit the Windows PATH variable to according to CUDA version you are using, so it should look like this `C:\Program Files\NVIDIA\CUDNN\v9.5\bin\12.6` please **double check** this PATH to avoid issues.
+- Additionally make sure that you have all possible **Visual C++ Redistributables** installed on your system, decent source for all-in-one package can be found [here](https://github.com/abbodi1406/vcredist) if you don't want to install each one of them manually.
+- After you make sure that PATH variables are correct you can utilize your GPU for tagging. If you followed the initial preparation/setup steps correctly — refer to the instructions below on how to add different models. Once you edited your wd.bat to use `--cpu 0` it should automatically install latest onnxruntime-gpu to your venv on the first run.
+
 ## FOR NORMAL USE:
 1. Open command line in the root folder and type start.bat or double-click if the convenience change has been made
 2. With Hydrus OPEN:
