@@ -1,0 +1,1 @@
+python -m wd-hydrus-tagger evaluate-api-batch --token b71dee08d530d430c63369ec2c48fbb3d04859db575c7fa452f048cf4151f25e --tag-service "ai tags" --cpu 1 --ratings-only 1 --model wd-v1-4-vit-tagger-v2 hashes.txt

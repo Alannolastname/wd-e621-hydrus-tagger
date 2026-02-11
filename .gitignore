@@ -3,3 +3,13 @@ wd-hydrus-tagger/__pycache__/*
 wd_hydrus_tagger.egg-info/*
 dist/*
 .idea
+onnx
+tmp
+bad-hashes.txt
+done-hashes-WD EVA02-Large v3 Tagger.txt
+done-hashes-WD V1.4 Vit V2 Tagger.txt
+done-hashes-Z3D E621 Convnext Tagger.txt
+hashes.txt
+log.txt
+*.onnx
+*.csv
