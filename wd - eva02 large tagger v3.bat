@@ -1,0 +1,1 @@
+python -m wd-hydrus-tagger evaluate-api-batch --privacy False --token 19aaa1040d8728358396efeed1702d7977feb3c39660e03ba1813921a1b4405e --tag-service "ai tags" --model wd-eva02-large-tagger-v3 --search-tag "-wd eva02-large v3 tagger ai generated tags"

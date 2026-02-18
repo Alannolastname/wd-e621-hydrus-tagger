@@ -73,7 +73,7 @@ def cli():
 @click.option("--search-tag", multiple=True,
               help="Hydrus tag(s) to search for (can be used multiple times)")
 @click.option("--token", help="Hydrus API token", required=True)
-@click.option("--cpu", default=False, help="Use CPU instead of GPU")
+@click.option("--cpu", default=True, help="Fales to Use GPU instead of CPU")
 @click.option("--model", default="wd-eva02-large-tagger-v3",
               help="Tagging model to use")
 @click.option("--threshold", default=0.35,
@@ -118,7 +118,11 @@ def evaluate_api_batch(hashfile, search_tag, token, cpu, model,
     # ----------------------------
     if search_tag:
         click.echo(f"Searching Hydrus for tags: {search_tag}")
-        hashes = client.search_files(tags=list(search_tag))
+        hashes = client.search_files(
+            tags=list(search_tag),
+            return_hashes=True
+        )
+
         click.echo(f"Found {len(hashes)} files.")
     elif hashfile:
         if not os.path.isfile(hashfile):
