@@ -1,3 +1,4 @@
+import os
 import os.path
 import click
 from PIL import Image, ImageFile, UnidentifiedImageError
@@ -7,23 +8,19 @@ from io import BytesIO
 import json
 import time
 import logging
-
-logging.basicConfig(
-    filename='log.txt',
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s'
-)
+from datetime import datetime
 
 Image.MAX_IMAGE_PIXELS = None
-
 from hydrus_api import APIError
 
 
+# -----------------------------
+# Retry wrapper
+# -----------------------------
 def get_file_with_retry(client, file_hash, retries=5, delay=5):
     for attempt in range(retries):
         try:
             return client.get_file(file_hash)
-
         except APIError as e:
             info = e.response.json()
 
@@ -37,8 +34,6 @@ def get_file_with_retry(client, file_hash, retries=5, delay=5):
 
             logging.error(f"retry fail file: {file_hash}")
             raise
-
-
 
 
 kaomojis = [
@@ -63,6 +58,7 @@ kaomojis = [
     "||_||",
 ]
 
+
 @click.group()
 def cli():
     pass
@@ -72,8 +68,8 @@ def cli():
 @click.option("--hashfile", help="Text file containing Hydrus hashes")
 @click.option("--search-tag", multiple=True,
               help="Hydrus tag(s) to search for (can be used multiple times)")
-@click.option("--token", help="Hydrus API token", required=True)
-@click.option("--cpu", default=True, help="Fales to Use GPU instead of CPU")
+@click.option("--token", required=True, help="Hydrus API token")
+@click.option("--cpu", default=True, help="False to Use GPU instead of CPU")
 @click.option("--model", default="wd-eva02-large-tagger-v3",
               help="Tagging model to use")
 @click.option("--threshold", default=0.35,
@@ -86,10 +82,31 @@ def cli():
               help="Strip all tags except content rating")
 @click.option("--privacy", default=True,
               help="Hide tag output from cli")
-def evaluate_api_batch(hashfile, search_tag, token, cpu, model,
-                       threshold, host, tag_service,
-                       ratings_only, privacy):
+def evaluate_api_batch(hashfile, search_tag, token, cpu,
+                       model, threshold, host,
+                       tag_service, ratings_only, privacy):
 
+    # -----------------------------
+    # Setup Logging
+    # -----------------------------
+    os.makedirs("logs", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    logfile = f"logs/{model}_{timestamp}.log"
+
+    logging.basicConfig(
+        filename=logfile,
+        level=logging.INFO,
+        format="%(asctime)s - %(message)s"
+    )
+
+    logging.info("=== WD HYDRUS TAGGER START ===")
+    logging.info(f"Model: {model}")
+    logging.info(f"CPU Mode: {cpu}")
+    logging.info(f"Tag Service: {tag_service}")
+
+    # -----------------------------
+    # Load model info
+    # -----------------------------
     if not os.path.isfile('./model/' + model + '/info.json'):
         raise ValueError("info.json not found in model folder!")
 
@@ -113,43 +130,69 @@ def evaluate_api_batch(hashfile, search_tag, token, cpu, model,
 
     client = hydrus_api.Client(token, host)
 
-    # ----------------------------
+    # -----------------------------
     # Determine file source
-    # ----------------------------
+    # -----------------------------
+    using_tag_search = False
+
     if search_tag:
+        using_tag_search = True
         click.echo(f"Searching Hydrus for tags: {search_tag}")
+        logging.info(f"Search Tags: {search_tag}")
+
         hashes = client.search_files(
             tags=list(search_tag),
             return_hashes=True
         )
 
         click.echo(f"Found {len(hashes)} files.")
+        logging.info(f"Found {len(hashes)} files via tag search")
+
     elif hashfile:
         if not os.path.isfile(hashfile):
             raise ValueError("hashfile not found!")
+
         with open(hashfile) as f:
             hashes = [line.strip() for line in f if line.strip()]
+
+        logging.info(f"Loaded {len(hashes)} hashes from file")
+
     else:
         raise ValueError("Provide either --search-tag or --hashfile")
 
+    # -----------------------------
+    # Done hash tracking (ONLY for hashfile mode)
+    # -----------------------------
     done_hashes = set()
     bad_hashes = set()
 
-    if os.path.exists(done_hashes_file):
-        with open(done_hashes_file, "r", encoding="utf-8") as f:
-            done_hashes = {line.strip() for line in f if line.strip()}
+    if not using_tag_search:
+        if os.path.exists(done_hashes_file):
+            with open(done_hashes_file, "r", encoding="utf-8") as f:
+                done_hashes = {line.strip() for line in f if line.strip()}
 
     if os.path.exists("bad-hashes.txt"):
         with open("bad-hashes.txt", "r", encoding="utf-8") as f:
             bad_hashes = {line.strip() for line in f if line.strip()}
 
+    # -----------------------------
+    # Processing Loop
+    # -----------------------------
+    processed_count = 0
+
     with click.progressbar(hashes) as bar:
         for file_hash in bar:
 
-            if not file_hash or file_hash in done_hashes or file_hash in bad_hashes:
+            file_hash = str(file_hash)
+
+            if not file_hash or file_hash in bad_hashes:
+                continue
+
+            if not using_tag_search and file_hash in done_hashes:
                 continue
 
             click.echo(" processing: " + file_hash)
+            logging.info(f"Processing: {file_hash}")
 
             try:
                 response = get_file_with_retry(client, file_hash)
@@ -228,15 +271,24 @@ def evaluate_api_batch(hashfile, search_tag, token, cpu, model,
                 service_names_to_tags={tag_service: clipped_tags}
             )
 
-            done_hashes.add(file_hash)
-            with open(done_hashes_file, "a", encoding="utf-8") as done_f:
-                done_f.write(file_hash + "\n")
+            processed_count += 1
+
+            # Only write done-hash if using hashfile mode
+            if not using_tag_search:
+                done_hashes.add(file_hash)
+                with open(done_hashes_file, "a", encoding="utf-8") as done_f:
+                    done_f.write(file_hash + "\n")
+
             # --- Micro pause: let tag write commit ---
             time.sleep(0.1)
             # --- Macro pause: only every 200 files ---
-            if len(done_hashes) % 200 == 0:
+            if processed_count % 200 == 0:
                 time.sleep(3)
-                logging.info(f"Processed {len(done_hashes)} files")
+                logging.info(f"Processed {processed_count} files")
+
+    logging.info(f"Total processed: {processed_count}")
+    logging.info("=== WD HYDRUS TAGGER FINISHED ===/n")
+    
 
 
 if __name__ == '__main__':
