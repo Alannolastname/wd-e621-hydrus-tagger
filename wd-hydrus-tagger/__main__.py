@@ -194,7 +194,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
     if search_tag:
         using_tag_search = True
-        click.echo(f"Searching Hydrus for tags: {search_tag}")
+        #click.echo(f"Searching Hydrus for tags: {search_tag}")
         logging.info(f"Search Tags: {search_tag}")
 
 
