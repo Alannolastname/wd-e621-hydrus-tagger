@@ -202,7 +202,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
         query_tags: list[str] = list(search_tag) + ["system:filetype is not ugoira, video"]
         client.search_files(tags=query_tags)  # warm up the search to avoid first-query lag
         
-        hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True))
+        hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=2))
 
 
         click.echo(f"Found {len(hashes)} files (excluding ugoira and video).")
@@ -296,7 +296,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
                 ratings: dict[str, float]
                 tags: dict[str, float]
-                ratings, tags = interrogator.interrogate(image)
+                ratings, tags = interrogator.interrogate(image) # pyright: ignore[reportArgumentType]
 
                 rating: str = "none"
                 if modelinfo['ratingsflag']:
