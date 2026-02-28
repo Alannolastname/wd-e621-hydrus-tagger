@@ -494,6 +494,22 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
     logging.info(f"Model: {model}")
     logging.info(f"CPU Mode: {cpu}")
     logging.info(f"Tag Service: {tag_service}")
+    # Clean up repository-local ffmpeg temporary files from previous runs
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        repo_tmp_dir = repo_root / "ffmpeg_temp"
+        if repo_tmp_dir.exists():
+            for p in repo_tmp_dir.iterdir():
+                try:
+                    if p.is_dir():
+                        shutil.rmtree(p)
+                    else:
+                        p.unlink()
+                except Exception:
+                    # ignore individual cleanup errors
+                    pass
+    except Exception:
+        logging.exception("Failed to clean ffmpeg_temp at startup")
 
     if not os.path.isfile('./model/' + model + '/info.json'):
         raise ValueError("info.json not found in model folder!")
@@ -608,8 +624,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             img.seek(i)
                             frame = img.convert("RGB").copy()
                             images.append(frame)
-                        if debug:
-                            click.echo(f"  found {len(images)} frames via PIL animation")
+                        click.echo(f"  found {len(images)} frames via PIL animation")
                     else:
                         img.close()
                 except Exception:
@@ -618,13 +633,17 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 # If not an animated image, attempt ffmpeg frame extraction
                 tmpdir = None
                 if not images:
-                    tmpdir_obj = tempfile.TemporaryDirectory()
-                    tmpdir = Path(tmpdir_obj.name)
-                    in_path = tmpdir / "input"
+                    # prefer using a repo-local temporary directory instead of
+                    # the system/AppData temp folder so extracted frames stay
+                    # inside the repository
+                    repo_root = Path(__file__).resolve().parents[1]
+                    repo_tmp_dir = repo_root / "ffmpeg_temp"
+                    repo_tmp_dir.mkdir(parents=True, exist_ok=True)
+                    in_path = repo_tmp_dir / f"input_{file_hash}"
                     with open(in_path, "wb") as f:
                         f.write(response.content)
 
-                    out_pattern = str(tmpdir / "frame_%05d.jpg")
+                    out_pattern = str(repo_tmp_dir / f"frame_{file_hash}_%05d.jpg")
                     # Prefer bundled ffmpeg in the repository under ./ffmpeg/bin,
                     # otherwise fall back to system `ffmpeg` on PATH.
                     repo_root = Path(__file__).resolve().parents[1]
@@ -638,22 +657,22 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                     # extract all frames; ffmpeg may be absent — ignore errors
                     # use -vsync 0 to avoid duplicate/drop frames, output as images
-                    cmd = [ffmpeg_cmd, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "2", out_pattern]
+                    cmd = [ffmpeg_cmd, "-y", "-i", str(in_path), "-fps_mode", "passthrough", "-q:v", "2", out_pattern]
                     try:
                         if debug:
                             click.echo("  extracting frames with ffmpeg...")
                             subprocess.run(cmd, check=False)
                         else:
+                            click.echo("  extracting frames with ffmpeg...")
                             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                        frames = sorted(tmpdir.glob("frame_*.jpg"))
+                        frames = sorted(repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"))
                         for p in frames:
                             try:
                                 fimg = Image.open(p).convert("RGB")
                                 images.append(fimg)
                             except Exception:
                                 continue
-                        if debug:
-                            click.echo(f"  extracted {len(frames)} frames via ffmpeg")
+                        click.echo(f"  extracted {len(frames)} frames via ffmpeg")
                     except FileNotFoundError:
                         # ffmpeg not found; treat as unreadable video
                         images = []
@@ -664,42 +683,45 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     bad_hashes.add(file_hash)
                     with open("bad-hashes.txt", "a", encoding="utf-8") as bad_f:
                         bad_f.write(file_hash + "\n")
-                    if tmpdir is not None:
-                        tmpdir_obj.cleanup() # pyright: ignore[reportPossiblyUnboundVariable]
+                    # remove any ffmpeg files produced for this hash
+                    try:
+                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportPossiblyUnboundVariable]
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+                        in_file = repo_tmp_dir / f"input_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+                        if in_file.exists():
+                            try:
+                                in_file.unlink()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     continue
 
                 selected = _select_frames_from_images(images)
-                if debug:
-                    click.echo(f"  selected {len(selected)} frames after similarity filtering")
+                click.echo(f"  selected {len(selected)} frames after similarity filtering")
 
                 # Aggregate tags over selected frames
                 agg_scores: dict[str, float] = {}
                 agg_ratings: dict[str, float] = {}
                 frames_processed = 0
                 total_frames = len(selected)
-                if debug:
-                    click.echo(f"  starting tagging of {total_frames} frames")
+                click.echo(f"  starting tagging of {total_frames} frames")
 
-                    def _show_idx(item) -> str:
-                        # item is a (idx, frame) tuple when using enumerate
-                        try:
-                            idx = item[0]
-                            return f"{idx+1}/{total_frames}"
-                        except Exception:
-                            return ""
+                def _show_idx(item) -> str:
+                    # item is a (idx, frame) tuple when using enumerate
+                    try:
+                        idx = item[0]
+                        return f"{idx+1}/{total_frames}"
+                    except Exception:
+                        return ""
 
-                    enumerated = list(enumerate(selected))
-                    with click.progressbar(enumerated, label="Tagging frames", length=total_frames, item_show_func=_show_idx) as pbar:
-                        for idx, frame in pbar:
-                            ratings, tags = interrogator.interrogate(frame)
-                            for t, s in tags.items():
-                                agg_scores[t] = agg_scores.get(t, 0.0) + float(s)
-                            for r, s in ratings.items():
-                                agg_ratings[r] = agg_ratings.get(r, 0.0) + float(s)
-                            frames_processed += 1
-                else:
-                    for frame in selected:
-                        ratings, tags = interrogator.interrogate(frame) # pyright: ignore[reportArgumentType]
+                enumerated = list(enumerate(selected))
+                with click.progressbar(enumerated, label="Tagging frames", length=total_frames, item_show_func=_show_idx) as pbar:
+                    for idx, frame in pbar:
+                        ratings, tags = interrogator.interrogate(frame)
                         for t, s in tags.items():
                             agg_scores[t] = agg_scores.get(t, 0.0) + float(s)
                         for r, s in ratings.items():
@@ -709,12 +731,45 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 if frames_processed == 0:
                     click.echo(f"No usable frames for {file_hash}")
                     logging.warning(f"No usable frames for {file_hash}")
-                    if tmpdir is not None:
-                        tmpdir_obj.cleanup() # pyright: ignore[reportPossiblyUnboundVariable]
+                    # remove any ffmpeg files produced for this hash
+                    try:
+                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportPossiblyUnboundVariable]
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+                        in_file = repo_tmp_dir / f"input_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+                        if in_file.exists():
+                            try:
+                                in_file.unlink()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     continue
 
-                if debug:
-                    click.echo(f"  processed {frames_processed} frames for {file_hash}")
+                # Ensure all selected frames were actually processed before sending tags
+                if frames_processed != total_frames:
+                    click.echo(f"Incomplete frame processing ({frames_processed}/{total_frames}) for {file_hash} — skipping tag write")
+                    logging.warning(f"Incomplete frame processing ({frames_processed}/{total_frames}) for {file_hash} — skipping tag write")
+                    # cleanup ffmpeg files for this hash
+                    try:
+                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportPossiblyUnboundVariable]
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+                        in_file = repo_tmp_dir / f"input_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+                        if in_file.exists():
+                            try:
+                                in_file.unlink()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    continue
+
+                click.echo(f"  processed {frames_processed} frames for {file_hash}")
 
                 # average scores across frames
                 for k in list(agg_scores.keys()):
@@ -763,8 +818,21 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                 time.sleep(0.1)
 
-                if tmpdir is not None:
-                    tmpdir_obj.cleanup() # pyright: ignore[reportPossiblyUnboundVariable]
+                # cleanup ffmpeg files created for this hash
+                try:
+                    for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportPossiblyUnboundVariable]
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+                    in_file = repo_tmp_dir / f"input_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+                    if in_file.exists():
+                        try:
+                            in_file.unlink()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
                 if processed_count % 200 == 0:
                     time.sleep(3)
