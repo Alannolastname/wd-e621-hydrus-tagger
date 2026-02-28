@@ -968,8 +968,9 @@ def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[
 
     Fetches a single video either from Hydrus (by hash) or from a local file,
     extracts frames (PIL or ffmpeg), runs `_select_frames_from_images` for
-    each supplied `--similarity` value and writes the selected frames into
-    `ffmpeg_temp/calibration_<label>_TIMESTAMP/` for inspection.
+    each supplied `--similarity` value and writes the results to the CLI and a summary text file in the repository. 
+    This allows users to calibrate the similarity threshold for frame selection by seeing how many frames are kept at different thresholds for a given video. 
+    The summary text file is written to the repository's `ffmpeg_temp` folder with a name like `summary_{hash}.txt` or `summary_{localfilename}.txt`.
 
     IMPORTANT: This command never sends tags back to Hydrus.
     """
@@ -1067,14 +1068,10 @@ def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[
         click.echo("No frames were extracted or detected; aborting calibration.")
         return
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    calib_dir = repo_tmp_dir / f"calibration_{label}_{timestamp}"
-    calib_dir.mkdir(parents=True, exist_ok=True)
-
     # If frames were extracted via ffmpeg record that at the top of the summary
     try:
         if extracted_frames_count is not None:
-            summary_file = calib_dir / "summary.txt"
+            summary_file = repo_tmp_dir / f"summary_{label}.txt"
             # write extraction line first so it appears at top
             with open(summary_file, "a", encoding="utf-8") as sf:
                 sf.write(f"  extracted {extracted_frames_count} frames via ffmpeg\n")
@@ -1087,21 +1084,15 @@ def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[
         click.echo(f"Threshold {thr}: selected {len(selected)} frames")
         # also append the summary line to a summary text file in the calibration folder
         try:
-            summary_file = calib_dir / "summary.txt"
+            summary_file = repo_tmp_dir / f"summary_{label}.txt"
             with open(summary_file, "a", encoding="utf-8") as sf:
                 sf.write(f"Threshold {thr}: selected {len(selected)} frames\n")
         except Exception:
             pass
-        thr_dir = calib_dir / f"thr_{str(thr).replace('.', '_')}"
-        thr_dir.mkdir(parents=True, exist_ok=True)
-        for i, img in enumerate(selected):
-            try:
-                img.save(thr_dir / f"frame_{i+1}.jpg", format="JPEG", quality=90)
-            except Exception:
-                pass
+
     
 
-    click.echo(f"Calibration artifacts written to: {calib_dir}")
+    click.echo(f"Calibration artifacts written to: {repo_tmp_dir}")
     click.echo("IMPORTANT: No tags were written to Hydrus by this command.")
 
 if __name__ == '__main__':
