@@ -37,9 +37,6 @@ import shutil
 from pathlib import Path
 from PIL import ImageChops, ImageStat
 
-if os.getenv("WD_ALLOW_LARGE_IMAGES", "0") == "1":
-    Image.MAX_IMAGE_PIXELS = None
-
 from hydrus_api import APIError
 
 
@@ -397,8 +394,20 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                 pass
         
     
+    
+# float=
+# similarity threshold for frame selection. Adjust to make filtering more or less aggressive.
+# The default value of 6.0 was chosen based on vibes and no real testing, but it seems to provide a reasonable balance for many videos, 
+# keeping frames that are visually distinct while filtering out near-duplicates.
+# but the optimal threshold may vary depending on the specific videos being processed and the desired balance between tag accuracy and processing efficiency. 
+# Depending on the content and frame rate of the videos being processed, users may want to adjust this threshold up or down. 
+# A lower threshold will keep more frames (including those with minor differences), 
+# while a higher threshold will be more selective and keep only frames that are more visually distinct from the last-kept frame.
 
-def _select_frames_from_images(images: list[PILImage], similarity_threshold: float = 6.0, max_frames: int = 40) -> list[PILImage]:
+# max_frames=
+# means no limit; set to a positive integer to keep only the first N sufficiently different frames.
+
+def _select_frames_from_images(images: list[PILImage], similarity_threshold: float = 6.0, max_frames: int = 0) -> list[PILImage]:
     """Select a subset of frames from a sequence by simple similarity filtering.
 
     The function performs a lightweight pairwise comparison using resized
@@ -409,7 +418,7 @@ def _select_frames_from_images(images: list[PILImage], similarity_threshold: flo
     :param images: Sequence of PIL images (RGB) to filter.
     :param similarity_threshold: Mean-difference threshold to decide if two
         frames are different enough to keep.
-    :param max_frames: Maximum number of frames to keep.
+    :param max_frames: Maximum number of frames to keep. Use 0 for no limit.
     :returns: A list of selected PIL images.
     """
     selected: list[PILImage] = []
@@ -426,7 +435,8 @@ def _select_frames_from_images(images: list[PILImage], similarity_threshold: flo
             if mean_diff >= similarity_threshold:
                 selected.append(img)
                 last_small = small
-        if len(selected) >= max_frames:
+        # If max_frames is > 0 enforce the limit; if 0 treat as unlimited
+        if max_frames > 0 and len(selected) >= max_frames:
             break
     return selected
 
@@ -683,9 +693,10 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     bad_hashes.add(file_hash)
                     with open("bad-hashes.txt", "a", encoding="utf-8") as bad_f:
                         bad_f.write(file_hash + "\n")
-                    # remove any ffmpeg files produced for this hash
+                    # remove any ffmpeg files produced for this hash, including
+                    # any previously-moved unused frames in deleted_{hash}
                     try:
-                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportPossiblyUnboundVariable]
+                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportOptionalMemberAccess, reportPossiblyUnboundVariable]
                             try:
                                 p.unlink()
                             except Exception:
@@ -696,12 +707,70 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                                 in_file.unlink()
                             except Exception:
                                 pass
+                        deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportOperatorIssue, reportPossiblyUnboundVariable]
+                        if deleted_dir.exists():
+                            try:
+                                shutil.rmtree(deleted_dir)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     continue
 
                 selected = _select_frames_from_images(images)
                 click.echo(f"  selected {len(selected)} frames after similarity filtering")
+
+                # If frames were extracted to the repository temp dir, remove
+                # any on-disk frame images that were not selected so the temp
+                # folder doesn't accumulate unused files.
+                try:
+                    repo_tmp_dir  # pyright: ignore[reportPossiblyUnboundVariable, reportUnusedExpression] # check if the variable exists in this scope
+                except NameError:
+                    repo_tmp_dir = None
+
+                if repo_tmp_dir is not None and repo_tmp_dir.exists(): # type: ignore
+                    frames_on_disk = sorted(repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg")) # pyright: ignore[reportPossiblyUnboundVariable]
+                    if frames_on_disk:
+                        if debug:
+                            # In debug mode, move unused extracted frames to a
+                            # per-hash "deleted" subfolder so the user can inspect
+                            # them separately.
+                            deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+                            try:
+                                deleted_dir.mkdir(parents=True, exist_ok=True)
+                            except Exception:
+                                deleted_dir = None
+
+                            # Determine which indices were kept by identity comparison
+                            used_indices = {i for i, img in enumerate(images) if img in selected}
+                            for idx, p in enumerate(frames_on_disk):
+                                if idx not in used_indices:
+                                    if deleted_dir is not None:
+                                        try:
+                                            p.rename(deleted_dir / p.name)
+                                        except Exception:
+                                            try:
+                                                p.unlink()
+                                            except Exception:
+                                                pass
+                                    else:
+                                        try:
+                                            p.unlink()
+                                        except Exception:
+                                            pass
+                        else:
+                            # Not in debug mode: keep all extracted frames in the
+                            # temp folder until the per-hash final cleanup runs.
+                            pass
+
+                # If debug flag set, pause after similarity filtering so user can
+                # inspect selected frames before tagging continues.
+                if debug:
+                    try:
+                        click.echo("Debug: press Enter to continue after similarity filtering.")
+                        input()
+                    except Exception:
+                        pass
 
                 # Aggregate tags over selected frames
                 agg_scores: dict[str, float] = {}
@@ -731,9 +800,10 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 if frames_processed == 0:
                     click.echo(f"No usable frames for {file_hash}")
                     logging.warning(f"No usable frames for {file_hash}")
-                    # remove any ffmpeg files produced for this hash
+                    # remove any ffmpeg files produced for this hash, including
+                    # any previously-moved unused frames in deleted_{hash}
                     try:
-                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportPossiblyUnboundVariable]
+                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportOptionalMemberAccess, reportPossiblyUnboundVariable]
                             try:
                                 p.unlink()
                             except Exception:
@@ -742,6 +812,12 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                         if in_file.exists():
                             try:
                                 in_file.unlink()
+                            except Exception:
+                                pass
+                        deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+                        if deleted_dir.exists():
+                            try:
+                                shutil.rmtree(deleted_dir)
                             except Exception:
                                 pass
                     except Exception:
@@ -752,9 +828,10 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 if frames_processed != total_frames:
                     click.echo(f"Incomplete frame processing ({frames_processed}/{total_frames}) for {file_hash} — skipping tag write")
                     logging.warning(f"Incomplete frame processing ({frames_processed}/{total_frames}) for {file_hash} — skipping tag write")
-                    # cleanup ffmpeg files for this hash
+                    # cleanup ffmpeg files for this hash, including any moved
+                    # unused frames stored in deleted_{hash}
                     try:
-                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportPossiblyUnboundVariable]
+                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportOptionalMemberAccess, reportPossiblyUnboundVariable]
                             try:
                                 p.unlink()
                             except Exception:
@@ -763,6 +840,12 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                         if in_file.exists():
                             try:
                                 in_file.unlink()
+                            except Exception:
+                                pass
+                        deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+                        if deleted_dir.exists():
+                            try:
+                                shutil.rmtree(deleted_dir)
                             except Exception:
                                 pass
                     except Exception:
@@ -818,9 +901,10 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                 time.sleep(0.1)
 
-                # cleanup ffmpeg files created for this hash
+                # cleanup ffmpeg files created for this hash, including any moved
+                # unused frames stored in deleted_{hash}
                 try:
-                    for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportPossiblyUnboundVariable]
+                    for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportOptionalMemberAccess, reportPossiblyUnboundVariable]
                         try:
                             p.unlink()
                         except Exception:
@@ -829,6 +913,12 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     if in_file.exists():
                         try:
                             in_file.unlink()
+                        except Exception:
+                            pass
+                    deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+                    if deleted_dir.exists():
+                        try:
+                            shutil.rmtree(deleted_dir)
                         except Exception:
                             pass
                 except Exception:
