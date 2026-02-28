@@ -393,7 +393,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                 # If stdin is not available, ignore and continue exiting
                 pass
         
-    
+
     
 # float=
 # similarity threshold for frame selection. Adjust to make filtering more or less aggressive.
@@ -955,9 +955,160 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 pass
 
 
+@click.command(name="video_similarity_calibration")
+@click.option("--file-hash", help="Hydrus file hash to fetch (mutually exclusive with --local-file)")
+@click.option("--local-file", help="Path to a local video file (mutually exclusive with --file-hash)")
+@click.option("--token", help="Hydrus API token (required if --file-hash used)")
+@click.option("--host", default="http://127.0.0.1:45869", help="Hydrus host (used with --file-hash)")
+@click.option("--similarity", default="10.0,9.0,8.0,7.0,6.0,5.0,4.0,3.0,2.0,1.0", help="Comma-separated similarity thresholds to test, e.g. '10.0,9.0,8.0'")
+@click.option("--max-frames", default=0, type=int, help="Maximum frames to keep per threshold (0 = unlimited)")
+@click.option("--debug", is_flag=True, default=False, help="Show debug output and keep extracted frames")
+def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[str], token: Optional[str], host: str, similarity: str, max_frames: int, debug: bool) -> None:
+    """Calibration helper: extract frames and test similarity thresholds.
+
+    Fetches a single video either from Hydrus (by hash) or from a local file,
+    extracts frames (PIL or ffmpeg), runs `_select_frames_from_images` for
+    each supplied `--similarity` value and writes the selected frames into
+    `ffmpeg_temp/calibration_<label>_TIMESTAMP/` for inspection.
+
+    IMPORTANT: This command never sends tags back to Hydrus.
+    """
+    if not file_hash and not local_file:
+        raise ValueError("Provide either --file-hash or --local-file")
+    if file_hash and not token:
+        raise ValueError("--token is required when using --file-hash")
+
+    # Obtain bytes for the input file
+    content_bytes: bytes
+    label = None
+    if file_hash:
+        client = hydrus_api.Client(token, host)
+        try:
+            response = get_file_with_retry(client, file_hash)
+        except Exception as e:
+            click.echo(f"Failed to fetch file from Hydrus: {e}")
+            return
+        content_bytes = response.content
+        label = file_hash
+    else:
+        p = Path(local_file) # pyright: ignore[reportArgumentType]
+        if not p.exists():
+            raise ValueError("Local file not found")
+        with open(p, "rb") as f:
+            content_bytes = f.read()
+        label = p.stem
+
+    images: list[PILImage] = []
+    extracted_frames_count: Optional[int] = None
+
+    # Parse similarity thresholds: accept comma-separated string like "10.0,9.0,8.0"
+    try:
+        if isinstance(similarity, str):
+            similarity_list: list[float] = [float(s.strip()) for s in similarity.split(",") if s.strip()]
+        else:
+            similarity_list = list(similarity)
+    except Exception:
+        click.echo("Invalid --similarity format; expected comma-separated floats")
+        return
+
+    # Try PIL animated image first
+    try:
+        img = Image.open(BytesIO(content_bytes))
+        if getattr(img, "is_animated", False) or getattr(img, "n_frames", 1) > 1:
+            for i in range(getattr(img, "n_frames", 1)):
+                img.seek(i)
+                frame = img.convert("RGB").copy()
+                images.append(frame)
+            click.echo(f"Found {len(images)} frames via PIL animation")
+        else:
+            img.close()
+    except Exception:
+        images = []
+
+    # If not animated via PIL, try ffmpeg extraction into repo-local tmp
+    repo_root = Path(__file__).resolve().parents[1]
+    repo_tmp_dir = repo_root / "ffmpeg_temp"
+    repo_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    if not images:
+        in_path = repo_tmp_dir / f"input_{label}"
+        with open(in_path, "wb") as f:
+            f.write(content_bytes)
+
+        out_pattern = str(repo_tmp_dir / f"frame_{label}_%05d.jpg")
+        bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == 'nt' else "ffmpeg")
+        if bundled_ffmpeg.exists():
+            ffmpeg_cmd = str(bundled_ffmpeg)
+            logging.info(f"Using bundled ffmpeg: {ffmpeg_cmd}")
+        else:
+            ffmpeg_cmd = "ffmpeg"
+            logging.info("Using system ffmpeg (no bundled ffmpeg found)")
+
+        cmd = [ffmpeg_cmd, "-y", "-i", str(in_path), "-fps_mode", "passthrough", "-q:v", "2", out_pattern]
+        try:
+            if debug:
+                click.echo("  extracting frames with ffmpeg...")
+                subprocess.run(cmd, check=False)
+            else:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            frames = sorted(repo_tmp_dir.glob(f"frame_{label}_*.jpg"))
+            for p in frames:
+                try:
+                    fimg = Image.open(p).convert("RGB")
+                    images.append(fimg)
+                except Exception:
+                    continue
+            extracted_frames_count = len(frames)
+            click.echo(f"  extracted {extracted_frames_count} frames via ffmpeg")
+        except FileNotFoundError:
+            click.echo("ffmpeg not found; unable to extract frames via ffmpeg")
+
+    if not images:
+        click.echo("No frames were extracted or detected; aborting calibration.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    calib_dir = repo_tmp_dir / f"calibration_{label}_{timestamp}"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+
+    # If frames were extracted via ffmpeg record that at the top of the summary
+    try:
+        if extracted_frames_count is not None:
+            summary_file = calib_dir / "summary.txt"
+            # write extraction line first so it appears at top
+            with open(summary_file, "a", encoding="utf-8") as sf:
+                sf.write(f"  extracted {extracted_frames_count} frames via ffmpeg\n")
+    except Exception:
+        pass
+
+    # Run selection for each supplied similarity threshold and save results
+    for thr in similarity_list:
+        selected = _select_frames_from_images(images, similarity_threshold=float(thr), max_frames=max_frames)
+        click.echo(f"Threshold {thr}: selected {len(selected)} frames")
+        # also append the summary line to a summary text file in the calibration folder
+        try:
+            summary_file = calib_dir / "summary.txt"
+            with open(summary_file, "a", encoding="utf-8") as sf:
+                sf.write(f"Threshold {thr}: selected {len(selected)} frames\n")
+        except Exception:
+            pass
+        thr_dir = calib_dir / f"thr_{str(thr).replace('.', '_')}"
+        thr_dir.mkdir(parents=True, exist_ok=True)
+        for i, img in enumerate(selected):
+            try:
+                img.save(thr_dir / f"frame_{i+1}.jpg", format="JPEG", quality=90)
+            except Exception:
+                pass
+    
+
+    click.echo(f"Calibration artifacts written to: {calib_dir}")
+    click.echo("IMPORTANT: No tags were written to Hydrus by this command.")
+
 if __name__ == '__main__':
     Image.init()
     ImageFile.LOAD_TRUNCATED_IMAGES = True
+    cli.add_command(video_similarity_calibration) # pyright: ignore[reportFunctionMemberAccess]
     cli.add_command(evaluate_api_batch) # pyright: ignore[reportFunctionMemberAccess]
     cli.add_command(evaluate_api_batch_video) # pyright: ignore[reportFunctionMemberAccess]
     cli()
+
