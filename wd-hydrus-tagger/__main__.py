@@ -15,9 +15,11 @@ The public commands exported to the Click CLI are:
 All functions in this module use type hints and Sphinx-style docstrings.
 """
 
+from __future__ import annotations
+
 import os
 import os.path
-import click
+import click # pyright: ignore[reportMissingImports]
 from PIL import Image, ImageFile, UnidentifiedImageError
 from PIL.Image import Image as PILImage
 from . import interrogate
@@ -35,7 +37,9 @@ import shutil
 from pathlib import Path
 from PIL import ImageChops, ImageStat
 
-Image.MAX_IMAGE_PIXELS = None
+if os.getenv("WD_ALLOW_LARGE_IMAGES", "0") == "1":
+    Image.MAX_IMAGE_PIXELS = None
+
 from hydrus_api import APIError
 
 
@@ -61,7 +65,10 @@ def get_file_with_retry(client: hydrus_api.Client, file_hash: str, retries: int 
         try:
             return client.get_file(file_hash)
         except APIError as e:
-            info = e.response.json()
+            try:
+                info = e.response.json()
+            except Exception:
+                info = {"status_code": getattr(getattr(e, 'response', None), 'status_code', None), "exception_type": None, "text": getattr(getattr(e, 'response', None), 'text', str(e))}
 
             if info.get("exception_type") == "FileMissingException":
                 raise
@@ -270,7 +277,10 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                     response: Any = get_file_with_retry(client, file_hash)
 
                 except hydrus_api.APIError as e:
-                    info = e.response.json()
+                    try:
+                        info = e.response.json()
+                    except Exception:
+                        info = {"status_code": getattr(getattr(e, 'response', None), 'status_code', None), "exception_type": None, "text": getattr(getattr(e, 'response', None), 'text', str(e))}
                     status = info.get("status_code")
                     etype = info.get("exception_type")
                     click.echo(f"Hydrus error {status} ({etype}) on {file_hash}")
@@ -306,7 +316,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
                 ratings: dict[str, float]
                 tags: dict[str, float]
-                ratings, tags = interrogator.interrogate(image) # pyright: ignore[reportArgumentType]
+                ratings, tags = interrogator.interrogate(image)  # pyright: ignore[reportArgumentType]
 
                 rating: str = "none"
                 if modelinfo['ratingsflag']:
@@ -342,7 +352,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
                 client.add_tags(
                     hashes=[file_hash],
-                    service_names_to_tags={tag_service: clipped_tags}
+                    service_names_to_tags={tag_service: clipped_tags} # pyright: ignore[reportCallIssue]
                 )
 
                 processed_count += 1
@@ -632,7 +642,9 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     try:
                         if debug:
                             click.echo("  extracting frames with ffmpeg...")
-                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                            subprocess.run(cmd, check=False)
+                        else:
+                            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                         frames = sorted(tmpdir.glob("frame_*.jpg"))
                         for p in frames:
                             try:
@@ -653,7 +665,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     with open("bad-hashes.txt", "a", encoding="utf-8") as bad_f:
                         bad_f.write(file_hash + "\n")
                     if tmpdir is not None:
-                        tmpdir_obj.cleanup()
+                        tmpdir_obj.cleanup() # pyright: ignore[reportPossiblyUnboundVariable]
                     continue
 
                 selected = _select_frames_from_images(images)
@@ -663,7 +675,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 # Aggregate tags over selected frames
                 agg_scores: dict[str, float] = {}
                 agg_ratings: dict[str, float] = {}
-                frames_processed = 0
                 frames_processed = 0
                 total_frames = len(selected)
                 if debug:
@@ -680,7 +691,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     enumerated = list(enumerate(selected))
                     with click.progressbar(enumerated, label="Tagging frames", length=total_frames, item_show_func=_show_idx) as pbar:
                         for idx, frame in pbar:
-                            ratings, tags = interrogator.interrogate(frame)  # pyright: ignore
+                            ratings, tags = interrogator.interrogate(frame)
                             for t, s in tags.items():
                                 agg_scores[t] = agg_scores.get(t, 0.0) + float(s)
                             for r, s in ratings.items():
@@ -688,7 +699,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             frames_processed += 1
                 else:
                     for frame in selected:
-                        ratings, tags = interrogator.interrogate(frame)  # pyright: ignore
+                        ratings, tags = interrogator.interrogate(frame) # pyright: ignore[reportArgumentType]
                         for t, s in tags.items():
                             agg_scores[t] = agg_scores.get(t, 0.0) + float(s)
                         for r, s in ratings.items():
@@ -699,7 +710,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     click.echo(f"No usable frames for {file_hash}")
                     logging.warning(f"No usable frames for {file_hash}")
                     if tmpdir is not None:
-                        tmpdir_obj.cleanup()
+                        tmpdir_obj.cleanup() # pyright: ignore[reportPossiblyUnboundVariable]
                     continue
 
                 if debug:
@@ -740,7 +751,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                 client.add_tags(
                     hashes=[file_hash],
-                    service_names_to_tags={tag_service: clipped_tags}
+                    service_names_to_tags={tag_service: clipped_tags} # pyright: ignore[reportCallIssue]
                 )
 
                 processed_count += 1
@@ -753,7 +764,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 time.sleep(0.1)
 
                 if tmpdir is not None:
-                    tmpdir_obj.cleanup()
+                    tmpdir_obj.cleanup() # pyright: ignore[reportPossiblyUnboundVariable]
 
                 if processed_count % 200 == 0:
                     time.sleep(3)
@@ -789,6 +800,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 if __name__ == '__main__':
     Image.init()
     ImageFile.LOAD_TRUNCATED_IMAGES = True
-    cli.add_command(evaluate_api_batch)
-    cli.add_command(evaluate_api_batch_video)
+    cli.add_command(evaluate_api_batch) # pyright: ignore[reportFunctionMemberAccess]
+    cli.add_command(evaluate_api_batch_video) # pyright: ignore[reportFunctionMemberAccess]
     cli()
