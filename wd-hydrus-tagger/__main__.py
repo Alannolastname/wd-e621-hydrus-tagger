@@ -553,7 +553,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
         # Include only animated/video types
         query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video"]
         client.search_files(tags=query_tags)
-        hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=1))
+        hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=16))
         click.echo(f"Found {len(hashes)} files (animated/video).")
         logging.info(f"Found {len(hashes)} files via tag search")
 
