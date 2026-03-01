@@ -583,13 +583,15 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
         using_tag_search = True
         logging.info(f"Search Tags: {search_tag}")
         # Include only animated/video types
-        query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video", "system:number of frames < 2,500"]
-        # system:number of frames < 2,500 = lose safeguard against long videos that would cause memory issues in the frame selection code.
+        query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video", "system:number of frames < 2,500", "system:filesize < 200MB"]
+        # system:number of frames < 2,500
+        # system:filesize < 200MB
+        # lose safeguards against long/big videos that would cause memory issues in the frame selection code.
         # this is a bit of a hack as ther seems to be a memory leak 
-        # or just bad code in my _select_frames_from_images function that causes it to consume more and more memory the more frames it processes,
-        # and 2,500 frames is around the point where it would start to cause issues on longer videos (even with the similarity filtering), 
-        # so this is a crude way to skip those while still allowing many longer videos to be processed. 
-        # Ideally I would fix the underlying issue in the frame selection code, but in the meantime this is a practical workaround to avoid crashing or freezing on very long videos.
+        # or just bad code in my _select_frames_from_images function that causes it to consume more and more memory the more frames it processes.
+        # this is a crude way to skip those while still allowing many other videos to be processed. 
+        # Ideally I would fix the underlying issue in the frame selection code, 
+        # but in the meantime this is a practical workaround to avoid crashing or freezing.
 
         client.search_files(tags=query_tags)
         hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=16))
