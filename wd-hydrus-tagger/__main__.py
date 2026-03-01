@@ -15,6 +15,8 @@ The public commands exported to the Click CLI are:
 All functions in this module use type hints and Sphinx-style docstrings.
 """
 
+
+
 from __future__ import annotations
 
 import os
@@ -24,28 +26,42 @@ from PIL import Image, ImageFile, UnidentifiedImageError
 from PIL.Image import Image as PILImage
 from . import interrogate
 import hydrus_api
+from hydrus_api import APIError
 from io import BytesIO
 import json
 import time
 import logging
 from datetime import datetime
 from typing import Any, Optional, cast
-
 import subprocess
 import shutil
 from pathlib import Path
 from PIL import ImageChops, ImageStat
 
-from hydrus_api import APIError
+from itertools import count
 
+
+
+# The memory_profiler import and setup is included here in the main module so that it can be used across all commands, 
+# including the video batch command which is where memory usage is more of a concern. 
+# The memory_profiler will log detailed memory usage information to a timestamped log file in the logs directory, 
+# which can be reviewed after running the commands to analyze memory behavior and identify potential issues.
+
+# @profile(stream=memory_profiler_logg) decorators are added to all functions even if they are not expected to have significant memory usage, 
+# to provide a complete picture of memory behavior across the entire execution of the commands.
 from memory_profiler import profile
-memory_profiler_logg = open("logs\memory_profiler.log", "w+", encoding="utf-8") # pyright: ignore[reportInvalidStringEscapeSequence]
+# Setup logging and model like the image batch command
+os.makedirs("logs", exist_ok=True)
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+memory_profiler_logg_shrug = f"logs/memory_profiler_{timestamp}.log"
+memory_profiler_logg = open(memory_profiler_logg_shrug, "w")  # Open the log file for writing memory profiler output
 
 
 
 # -----------------------------
 # Retry wrapper
 # -----------------------------
+@profile(stream=memory_profiler_logg)
 def get_file_with_retry(client: hydrus_api.Client, file_hash: str, retries: int = 5, delay: int = 5) -> Any:
     """Fetch a file from a Hydrus server with retry semantics.
 
@@ -106,6 +122,7 @@ kaomojis: list[str] = [
 
 
 @click.group()
+@profile(stream=memory_profiler_logg)
 def cli():
     """Top-level Click command group for the WD Hydrus Tagger CLI.
 
@@ -117,7 +134,6 @@ def cli():
 
 
 @click.command()
-@profile(stream=memory_profiler_logg)
 @click.option("--hashfile", help="Text file containing Hydrus hashes")
 @click.option("--search-tag", multiple=True,
               help="Hydrus tag(s) to search for (can be used multiple times)")
@@ -137,6 +153,7 @@ def cli():
               help="Hide tag output from cli")
 @click.option("--debug", is_flag=True, default=False,
               help="Show debug progress and pause before exit")
+@profile(stream=memory_profiler_logg)
 def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], token: str, cpu: bool,
                        model: str, threshold: float, host: str,
                        tag_service: str, ratings_only: bool, privacy: bool, debug: bool) -> None:
@@ -259,8 +276,16 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
     processed_count = 0
     interrupted = False
 
+    # gpt speacial:
+    
+    counterh = count(1)
+    totalh = len(hashes)
+    @profile(stream=memory_profiler_logg)
+    def _show_idh(_):
+        return f"{next(counterh)}/{totalh}"
+
     try:
-        with click.progressbar(hashes) as bar:
+        with click.progressbar(hashes, length=totalh, item_show_func=_show_idh) as bar:
             for file_hash in bar:
 
                 file_hash = str(file_hash)
@@ -373,7 +398,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
     except KeyboardInterrupt:
         interrupted = True
-        click.echo("\n⚠ Interrupted by user (Ctrl+C)")
+        click.echo("\n[!] Interrupted by user (Ctrl+C)")
         logging.warning("=== INTERRUPTED BY USER (CTRL+C) ===")
 
     finally:
@@ -446,7 +471,6 @@ def _select_frames_from_images(images: list[PILImage], similarity_threshold: flo
 
 
 @click.command()
-@profile(stream=memory_profiler_logg)
 @click.option("--hashfile", help="Text file containing Hydrus hashes")
 @click.option("--search-tag", multiple=True,
               help="Hydrus tag(s) to search for (can be used multiple times)")
@@ -466,6 +490,7 @@ def _select_frames_from_images(images: list[PILImage], similarity_threshold: flo
               help="Hide tag output from cli")
 @click.option("--debug", is_flag=True, default=False,
               help="Show debug progress for video processing")
+@profile(stream=memory_profiler_logg)
 def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...], token: str, cpu: bool,
                              model: str, threshold: float, host: str,
                              tag_service: str, ratings_only: bool, privacy: bool, debug: bool) -> None:
@@ -551,7 +576,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
     client: hydrus_api.Client = hydrus_api.Client(token, host)
 
-    # Determine file source (search for video-like content)
+    # Determine file source (search for video content)
     using_tag_search: bool = False
 
     if search_tag:
@@ -600,8 +625,19 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
     processed_count = 0
     interrupted = False
 
+    # gpt speacial: 
+    # I added a custom progress bar item_show_func to display the current index and total count of hashes being processed,
+    # since video processing can take significantly longer than single images and it's helpful to have a sense of progress through the batch. 
+    # The counterh generator is used to keep track of the current index in a way that works with the progress bar's iteration. 
+    # This should provide more informative progress feedback during long video batch runs.
+    counterh = count(1)
+    totalh = len(hashes)
+    @profile(stream=memory_profiler_logg)
+    def _show_idh(_):
+        return f"{next(counterh)}/{totalh}"
+
     try:
-        with click.progressbar(hashes) as bar:
+        with click.progressbar(hashes, length=totalh, item_show_func=_show_idh) as bar:
             for file_hash in bar:
                 file_hash = str(file_hash)
 
@@ -799,6 +835,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 click.echo(f"  starting tagging of {total_frames} frames")
                 logging.info(f"Starting tagging of {total_frames} frames")
 
+                @profile(stream=memory_profiler_logg)
                 def _show_idx(item) -> str:
                     # item is a (idx, frame) tuple when using enumerate
                     try:
@@ -951,7 +988,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
     except KeyboardInterrupt:
         interrupted = True
-        click.echo("\n⚠ Interrupted by user (Ctrl+C)")
+        click.echo("\n[!] Interrupted by user (Ctrl+C)")
         logging.warning("=== INTERRUPTED BY USER (CTRL+C) ===")
 
     finally:
@@ -977,7 +1014,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
 
 @click.command(name="video_similarity_calibration")
-@profile(stream=memory_profiler_logg)
 @click.option("--file-hash", help="Hydrus file hash to fetch (mutually exclusive with --local-file)")
 @click.option("--local-file", help="Path to a local video file (mutually exclusive with --file-hash)")
 @click.option("--token", help="Hydrus API token (required if --file-hash used)")
@@ -985,6 +1021,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 @click.option("--similarity", default="10.0,9.0,8.0,7.0,6.0,5.0,4.0,3.0,2.0,1.0", help="Comma-separated similarity thresholds to test, e.g. '10.0,9.0,8.0'")
 @click.option("--max-frames", default=0, type=int, help="Maximum frames to keep per threshold (0 = unlimited)")
 @click.option("--debug", is_flag=True, default=False, help="Show debug output and keep extracted frames")
+@profile(stream=memory_profiler_logg)
 def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[str], token: Optional[str], host: str, similarity: str, max_frames: int, debug: bool) -> None:
     """Calibration helper: extract frames and test similarity thresholds.
 
