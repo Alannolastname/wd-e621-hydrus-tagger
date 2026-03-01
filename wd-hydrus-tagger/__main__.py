@@ -31,13 +31,16 @@ import logging
 from datetime import datetime
 from typing import Any, Optional, cast
 
-import tempfile
 import subprocess
 import shutil
 from pathlib import Path
 from PIL import ImageChops, ImageStat
 
 from hydrus_api import APIError
+
+from memory_profiler import profile
+memory_profiler_logg = open("logs\memory_profiler.log", "w+", encoding="utf-8") # pyright: ignore[reportInvalidStringEscapeSequence]
+
 
 
 # -----------------------------
@@ -114,6 +117,7 @@ def cli():
 
 
 @click.command()
+@profile(stream=memory_profiler_logg)
 @click.option("--hashfile", help="Text file containing Hydrus hashes")
 @click.option("--search-tag", multiple=True,
               help="Hydrus tag(s) to search for (can be used multiple times)")
@@ -397,17 +401,17 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
     
 # float=
 # similarity threshold for frame selection. Adjust to make filtering more or less aggressive.
-# The default value of 6.0 was chosen based on vibes and no real testing, but it seems to provide a reasonable balance for many videos, 
-# keeping frames that are visually distinct while filtering out near-duplicates.
-# but the optimal threshold may vary depending on the specific videos being processed and the desired balance between tag accuracy and processing efficiency. 
-# Depending on the content and frame rate of the videos being processed, users may want to adjust this threshold up or down. 
+# the default value of 12.0 was chosen based on some testing using using video_similarity_calibration,
+# to avrage around the point where a speed gain would decrease and tag quality would start to noticeably degrade for some videos.
+# but the optimal threshold may vary depending on the specific videos being processed and the desired balance between tag accuracy and processing efficiency.
+# Depending on the content and frame rate of the videos being processed, users may want to adjust this threshold up or down.
 # A lower threshold will keep more frames (including those with minor differences), 
 # while a higher threshold will be more selective and keep only frames that are more visually distinct from the last-kept frame.
 
 # max_frames=
-# means no limit; set to a positive integer to keep only the first N sufficiently different frames.
-
-def _select_frames_from_images(images: list[PILImage], similarity_threshold: float = 6.0, max_frames: int = 0) -> list[PILImage]:
+# 0 means no limit; set to a positive integer to keep only the first N sufficiently different frames.
+@profile(stream=memory_profiler_logg)
+def _select_frames_from_images(images: list[PILImage], similarity_threshold: float = 12.0, max_frames: int = 0) -> list[PILImage]:
     """Select a subset of frames from a sequence by simple similarity filtering.
 
     The function performs a lightweight pairwise comparison using resized
@@ -442,6 +446,7 @@ def _select_frames_from_images(images: list[PILImage], similarity_threshold: flo
 
 
 @click.command()
+@profile(stream=memory_profiler_logg)
 @click.option("--hashfile", help="Text file containing Hydrus hashes")
 @click.option("--search-tag", multiple=True,
               help="Hydrus tag(s) to search for (can be used multiple times)")
@@ -511,9 +516,11 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
         if repo_tmp_dir.exists():
             for p in repo_tmp_dir.iterdir():
                 try:
-                    if p.is_dir():
+                    # Delete only folders starting with "deleted_"
+                    if p.is_dir() and p.name.startswith("deleted_"):
                         shutil.rmtree(p)
-                    else:
+                     # Delete only files matching "frame_*.jpg"
+                    elif p.is_file() and p.name.startswith("frame_") and p.suffix == ".jpg":
                         p.unlink()
                 except Exception:
                     # ignore individual cleanup errors
@@ -551,9 +558,18 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
         using_tag_search = True
         logging.info(f"Search Tags: {search_tag}")
         # Include only animated/video types
-        query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video"]
+        query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video", "system:number of frames < 2,500"]
+        # system:number of frames < 2,500 = lose safeguard against long videos that would cause memory issues in the frame selection code.
+        # this is a bit of a hack as ther seems to be a memory leak 
+        # or just bad code in my _select_frames_from_images function that causes it to consume more and more memory the more frames it processes,
+        # and 2,500 frames is around the point where it would start to cause issues on longer videos (even with the similarity filtering), 
+        # so this is a crude way to skip those while still allowing many longer videos to be processed. 
+        # Ideally I would fix the underlying issue in the frame selection code, but in the meantime this is a practical workaround to avoid crashing or freezing on very long videos.
+
         client.search_files(tags=query_tags)
         hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=16))
+        # sort type 16 is "system:number of frames", which should help with processing efficiency by front-loading shorter videos that are less likely to hit memory issues
+
         click.echo(f"Found {len(hashes)} files (animated/video).")
         logging.info(f"Found {len(hashes)} files via tag search")
 
@@ -635,6 +651,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             frame = img.convert("RGB").copy()
                             images.append(frame)
                         click.echo(f"  found {len(images)} frames via PIL animation")
+                        logging.info(f"Found {len(images)} frames via PIL animation")
                     else:
                         img.close()
                 except Exception:
@@ -660,10 +677,10 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
                     if bundled_ffmpeg.exists():
                         ffmpeg_cmd = str(bundled_ffmpeg)
-                        logging.info(f"Using bundled ffmpeg: {ffmpeg_cmd}")
+                        #logging.info(f"Using bundled ffmpeg: {ffmpeg_cmd}")
                     else:
                         ffmpeg_cmd = "ffmpeg"
-                        logging.info("Using system ffmpeg (no bundled ffmpeg found)")
+                        #logging.info("Using system ffmpeg (no bundled ffmpeg found)")
 
                     # extract all frames; ffmpeg may be absent — ignore errors
                     # use -vsync 0 to avoid duplicate/drop frames, output as images
@@ -683,6 +700,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             except Exception:
                                 continue
                         click.echo(f"  extracted {len(frames)} frames via ffmpeg")
+                        logging.info(f"Extracted {len(frames)} frames via ffmpeg")
                     except FileNotFoundError:
                         # ffmpeg not found; treat as unreadable video
                         images = []
@@ -719,6 +737,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                 selected = _select_frames_from_images(images)
                 click.echo(f"  selected {len(selected)} frames after similarity filtering")
+                logging.info(f"Selected {len(selected)} frames after similarity filtering")
 
                 # If frames were extracted to the repository temp dir, remove
                 # any on-disk frame images that were not selected so the temp
@@ -778,6 +797,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 frames_processed = 0
                 total_frames = len(selected)
                 click.echo(f"  starting tagging of {total_frames} frames")
+                logging.info(f"Starting tagging of {total_frames} frames")
 
                 def _show_idx(item) -> str:
                     # item is a (idx, frame) tuple when using enumerate
@@ -853,6 +873,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     continue
 
                 click.echo(f"  processed {frames_processed} frames for {file_hash}")
+                logging.info(f"Processed {frames_processed} frames for {file_hash}")
 
                 # average scores across frames
                 for k in list(agg_scores.keys()):
@@ -956,6 +977,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
 
 @click.command(name="video_similarity_calibration")
+@profile(stream=memory_profiler_logg)
 @click.option("--file-hash", help="Hydrus file hash to fetch (mutually exclusive with --local-file)")
 @click.option("--local-file", help="Path to a local video file (mutually exclusive with --file-hash)")
 @click.option("--token", help="Hydrus API token (required if --file-hash used)")
@@ -998,6 +1020,20 @@ def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[
         with open(p, "rb") as f:
             content_bytes = f.read()
         label = p.stem
+
+
+    # Setup logging and model like the image batch command
+    os.makedirs("logs", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    logfile = f"logs/vsc_{timestamp}_{label}.log"
+
+    logging.basicConfig(
+        filename=logfile,
+        level=logging.INFO,
+        format="%(asctime)s - %(message)s"
+    )
+
+
 
     images: list[PILImage] = []
     extracted_frames_count: Optional[int] = None
@@ -1073,6 +1109,7 @@ def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[
         if extracted_frames_count is not None:
             summary_file = repo_tmp_dir / f"summary_{label}.txt"
             # write extraction line first so it appears at top
+            logging.info(f"  extracted {extracted_frames_count} frames via ffmpeg")
             with open(summary_file, "a", encoding="utf-8") as sf:
                 sf.write(f"  extracted {extracted_frames_count} frames via ffmpeg\n")
     except Exception:
@@ -1083,14 +1120,17 @@ def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[
         selected = _select_frames_from_images(images, similarity_threshold=float(thr), max_frames=max_frames)
         click.echo(f"Threshold {thr}: selected {len(selected)} frames")
         # also append the summary line to a summary text file in the calibration folder
+        logging.info(f"Threshold {thr}: selected {len(selected)} frames")
         try:
             summary_file = repo_tmp_dir / f"summary_{label}.txt"
             with open(summary_file, "a", encoding="utf-8") as sf:
                 sf.write(f"Threshold {thr}: selected {len(selected)} frames\n")
         except Exception:
             pass
+        #stop if only one frame is selected
+        if len(selected) == 1:
+            break
 
-    
 
     click.echo(f"Calibration artifacts written to: {repo_tmp_dir}")
     click.echo("IMPORTANT: No tags were written to Hydrus by this command.")
