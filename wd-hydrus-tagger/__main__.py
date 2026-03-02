@@ -19,6 +19,7 @@ most functions in this module use type hints and Sphinx-style docstrings.
 
 from __future__ import annotations
 
+from math import log
 import os
 import os.path
 import click # pyright: ignore[reportMissingImports]
@@ -443,8 +444,20 @@ def _get_frames_generator(images_source):
         yield img
         # The frame will be closed in the calling loop after it is processed.
 
+
+
+# float=
+# ! DO NOT EDIT IT HERE ! as its overridden for/below pil_frame_gen and ffmpeg_frame_gen 
+# so edit in those functions instead if you want to change the default threshold for frame selection.
+
+# similarity threshold for frame selection. Adjust to make filtering more or less aggressive.
+# A lower threshold will keep more frames (including those with minor differences) and use more RAM, 
+# while a higher threshold will be more selective and keep only frames that are more visually distinct from the last-kept frame (and use less RAM).
+
+# max_frames=
+# 0 means no limit; set to a positive integer to keep only the first N sufficiently different frames.
 @profile(stream=memory_profiler_logg)
-def _select_frames_streaming(frame_generator: Iterator[PILImage], similarity_threshold: float = 12.0, max_frames: int = 0) -> list[PILImage]:
+def _select_frames_streaming(frame_generator: Iterator[PILImage], similarity_threshold: float = 50.0, max_frames: int = 0) -> list[PILImage]:
     """Optimized frame selection directly from a generator to save RAM.
     Rejected frames are closed immediately.
     """
@@ -685,14 +698,21 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
 
                 # --- Frame Generators for RAM Efficiency ---
+                @profile(stream=memory_profiler_logg)
                 def pil_frame_gen(data: bytes):
+                    count = 0
                     with Image.open(BytesIO(data)) as container:
                         n = getattr(container, "n_frames", 1)
                         for i in range(n):
                             container.seek(i)
+                            count += 1
                             yield container.convert("RGB")
+                    click.echo(f"[pil] Total frames extracted: {count}")
+                    logging.info(f"[pil] Total frames extracted: {count} for {file_hash}")
 
+                @profile(stream=memory_profiler_logg)
                 def ffmpeg_frame_gen(data: bytes, h: str, tmp_dir: Path):
+                    count = 0
                     in_path = tmp_dir / f"vid_{h}"
                     in_path.write_bytes(data)
                     out_pattern = str(tmp_dir / f"frame_{h}_%05d.jpg")
@@ -706,9 +726,12 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     
                     for p in sorted(tmp_dir.glob(f"frame_{h}_*.jpg")):
                         with Image.open(p) as f_img:
+                            count += 1
                             yield f_img.convert("RGB")
                         p.unlink()
                     if in_path.exists(): in_path.unlink()
+                    click.echo(f"[ffmpeg] Total frames extracted: {count}")
+                    logging.info(f"[ffmpeg] Total frames extracted: {count} for {file_hash}")
 
                 repo_root = Path(__file__).resolve().parents[1]
                 repo_tmp_dir = repo_root / "ffmpeg_temp"
@@ -716,16 +739,21 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                 try:
                     # Attempt PIL (GIF/APNG)
-                    selected = _select_frames_streaming(pil_frame_gen(response.content))
+                    threshold = 12.0
+                    selected = _select_frames_streaming(pil_frame_gen(response.content),similarity_threshold=threshold)
                 except Exception:
                     # Fallback to FFmpeg (Videos)
-                    selected = _select_frames_streaming(ffmpeg_frame_gen(response.content, file_hash, repo_tmp_dir))
+                    threshold = 12.0
+                    selected = _select_frames_streaming(ffmpeg_frame_gen(response.content, file_hash, repo_tmp_dir),similarity_threshold=threshold)
 
                 if not selected:
                     logging.warning(f"No frames selected for {file_hash}")
                     continue
 
-                click.echo(f"  selected {len(selected)} frames after similarity filtering")
+                click.echo(f"Similarity threshold > {threshold:.2f}")
+                click.echo(f"kept frames {len(selected)} frames")
+                logging.info(f"Similarity threshold > {threshold:.2f} = kept frames {len(selected)} frames for {file_hash}")
+                logging.info(f"kept frames {len(selected)} frames for {file_hash}")
                 
                 agg_scores: dict[str, float] = {}
                 agg_ratings: dict[str, float] = {}
@@ -859,6 +887,7 @@ def video_similarity_calibration(file_hash: Optional[str], local_file: Optional[
     repo_tmp_dir = repo_root / "ffmpeg_temp"
     repo_tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    @profile(stream=memory_profiler_logg)
     def pil_gen(data: bytes):
         with Image.open(BytesIO(data)) as img:
             for i in range(getattr(img, "n_frames", 1)):
