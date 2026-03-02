@@ -435,6 +435,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 # new frame logic
 # =============================================================================================================================================
 
+# dont remeber why this wrapper is needed but keeping it just in case, also it has the profile decorator for memory logging
 @profile(stream=memory_profiler_logg)
 def _get_frames_generator(images_source):
     """This helper function yields frames one at a time from the source, allowing for memory-efficient processing."""
@@ -475,6 +476,7 @@ def _select_frames_streaming(frame_generator: Iterator[PILImage], similarity_thr
             
     return selected
 
+# dont remeber why this wrapper is needed but keeping it just in case, also it has the profile decorator for memory logging
 @profile(stream=memory_profiler_logg)
 def _select_frames_from_images(images: list[PILImage], similarity_threshold: float = 12.0, max_frames: int = 0):
     """Legacy wrapper modified to use streaming logic for memory efficiency."""
