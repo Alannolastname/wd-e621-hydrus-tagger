@@ -612,8 +612,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
         using_tag_search = True
         logging.info(f"Search Tags: {search_tag}")
         # Include only animated/video types not images
-        query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video", "system:number of frames < 2,500"]
-        # hard limits on frames to test limitations and avoid processing extremely large videos that could cause memory issues. Adjust as needed.
+        query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video"]
 
 
         client.search_files(tags=query_tags)
@@ -734,7 +733,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     for p in sorted(tmp_dir.glob(f"frame_{h}_*.jpg")):
                         with Image.open(p) as f_img:
                             count += 1
-                            yield f_img.convert("RGB").resize((1280, 720))  # Resize for faster processing; adjust as needed
+                            yield f_img.convert("RGB").resize((448, 448))  # Resize for faster processing; adjust as needed
                         p.unlink()
                     if in_path.exists(): in_path.unlink()
                     click.echo(f"[ffmpeg] Total frames extracted: {count}")
