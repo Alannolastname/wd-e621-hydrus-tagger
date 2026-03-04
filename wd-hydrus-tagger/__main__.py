@@ -752,13 +752,17 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
                     ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
-                    subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "2", out_pattern],
+                    subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), 
+                                    "-vf", "scale=448:448:force_original_aspect_ratio=decrease,pad=448:448:(ow-iw)/2:(oh-ih)/2", 
+                                    "-fps_mode", "passthrough", 
+                                    "-q:v", "2", 
+                                    out_pattern],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                     
                     for p in sorted(tmp_dir.glob(f"frame_{h}_*.jpg")):
                         with Image.open(p) as f_img:
                             count += 1
-                            yield f_img.convert("RGB").resize((448, 448))  # Resize for faster processing; adjust as needed
+                            yield f_img.convert("RGB")
                         p.unlink()
                     if in_path.exists(): in_path.unlink()
                     logging.info(f"[ffmpeg] Total frames extracted: {count} for {file_hash}")
@@ -768,7 +772,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 repo_tmp_dir.mkdir(parents=True, exist_ok=True)
 
 
-
+                # Threshold for frame selection (lower = more frames, higher = fewer frames)"
                 similarity_threshold_ff = 12.0
 
                 try:
@@ -789,9 +793,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     threshold=threshold,
                     ratingsflag=modelinfo['ratingsflag'],
                 )
-
-
-
 
 
                 click.echo(f"Similarity threshold > {similarity_threshold_ff:.2f}")
@@ -954,35 +955,40 @@ def video_similarity_calibration(
 
         # --- Erst-Extraktion der 64x64 Vergleichsbilder ---
         if not is_pil:
-            # Falls no-cache, extrahieren wir direkt kleine Bilder auf Disk
-            # Falls RAM-Cache, extrahieren wir normal und resizen dann in den RAM
-            click.echo(f"[INFO] Video detected. Preparing 64x64 thumbnails ({'Disk' if no_cache else 'RAM'})...")
+            click.echo(f"[INFO] Video detected. Extracting 64x64 thumbnails via FFmpeg...")
             in_path = repo_tmp_dir / f"vid_{label}"
             in_path.write_bytes(content_bytes)
             
             bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
             ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
-            if no_cache:
-                # Extrahiere direkt 64x64 Graustufen JPEGs auf Disk um RAM zu sparen
-                out_pattern = str(repo_tmp_dir / f"small_{label}_%05d.jpg")
-                subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vf", "scale=64:64,format=gray", "-q:v", "4", out_pattern],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            else:
-                # Extrahiere einmalig zum Einlesen in den RAM
-                out_pattern = str(repo_tmp_dir / f"temp_ext_{label}_%05d.jpg")
-                subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "4", out_pattern],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                
-                # In den RAM laden und Originale löschen
-                temp_files = sorted(repo_tmp_dir.glob(f"temp_ext_{label}_*.jpg"))
-                for p in temp_files:
-                    with Image.open(p) as tmp_img:
-                        ram_cache.append(tmp_img.resize((64, 64)).convert("L"))
-                    p.unlink()
+            # Wir lassen FFmpeg IMMER die Arbeit machen (64x64, Graustufen)
+            # Das spart massiv Zeit beim Schreiben/Lesen
+            out_pattern = str(repo_tmp_dir / f"small_{label}_%05d.jpg")
+            subprocess.run([
+                ffmpeg_exe, "-y", "-i", str(in_path), 
+                "-vf", "scale=64:64,format=gray", 
+                "-q:v", "4", 
+                out_pattern
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             
             if in_path.exists(): in_path.unlink()
+
+            if not no_cache:
+                # Normaler Modus: In den RAM laden und Dateien sofort löschen
+                click.echo("[INFO] Caching thumbnails to RAM...")
+                temp_files = sorted(repo_tmp_dir.glob(f"small_{label}_*.jpg"))
+                for p in temp_files:
+                    with Image.open(p) as tmp_img:
+                        # .copy() stellt sicher, dass das Bild im RAM bleibt, 
+                        # auch wenn die Datei geschlossen wird
+                        ram_cache.append(tmp_img.copy())
+                    p.unlink()
+            else:
+                click.echo("[INFO] Using disk-based cache (--no-cache).")
+            
             click.echo("[INFO] Preparation complete.")
+            
         else:
             # PIL Animation (GIF etc)
             with Image.open(BytesIO(content_bytes)) as container:
@@ -1016,7 +1022,7 @@ def video_similarity_calibration(
             with click.progressbar(
                 frame_gen,
                 length=total_len,
-                label=f"Calibration (Thr {thr})",
+                label=f"(Thr {thr})",
                 item_show_func=progress_label
             ) as bar:
                 for small_img in bar:
