@@ -38,8 +38,8 @@ import subprocess
 import shutil
 from pathlib import Path
 from itertools import count
-
 import gc
+import re
 
 
 
@@ -908,7 +908,6 @@ def video_similarity_calibration(
     label: str = ""
     is_pil = False
     
-    # Der Cache speichert nur die winzigen 64x64 Graustufen-Bilder
     ram_cache: list[PILImage] = []
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -916,6 +915,7 @@ def video_similarity_calibration(
     repo_tmp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        # 1. Datenquelle identifizieren
         if file_hash:
             client = hydrus_api.Client(token, host)
             try:
@@ -935,25 +935,45 @@ def video_similarity_calibration(
                 return
             content_bytes = p.read_bytes()
             label = p.stem
-            total_video_frames = 0
+            total_video_frames = 0 # Wird bei Videos später durch FFmpeg/Prob erkannt falls nötig
         else:
             raise ValueError("Provide --file-hash or --local-file")
 
         summary_file = repo_tmp_dir / f"summary_{label}.txt"
-        with open(summary_file, "w", encoding="utf-8") as sf:
-            sf.write(f"Calibration for: {label}\n")
-            sf.write(f"Total File frames: {total_video_frames}\n")
-            click.echo(f"[INFO] Total File frames: {total_video_frames}")
-            sf.write("-" * 30 + "\n")
 
-        # Check ob PIL (GIF/APNG) oder Video
+        # 2. Bestehende Summary prüfen (Resume Logik)
+        already_tested = {}
+        if summary_file.exists():
+            click.echo(f"[INFO] Summary file found. Checking progress...")
+            with open(summary_file, "r", encoding="utf-8") as rf:
+                content = rf.read()
+                # Suche alle bereits fertigen Thresholds
+                matches = re.findall(r"Threshold\s+([0-9.]+):\s+selected\s+([0-9]+)", content)
+                for thr_str, sel_str in matches:
+                    already_tested[float(thr_str)] = int(sel_str)
+            
+            # Abbruch falls der letzte Test bereits <= 1 Frame ergab
+            if already_tested:
+                last_thr = list(already_tested.keys())[-1]
+                if already_tested[last_thr] <= 1:
+                    click.echo(f"[INFO] Last result for Thr {last_thr} was <= 1. Already finished.")
+                    return
+
+        # Header nur schreiben wenn Datei neu ist
+        if not summary_file.exists():
+            with open(summary_file, "w", encoding="utf-8") as sf:
+                sf.write(f"Calibration for: {label}\n")
+                sf.write(f"Total File frames: {total_video_frames}\n")
+                sf.write("-" * 30 + "\n")
+
+        # 3. Medien-Typ prüfen
         try:
             with Image.open(BytesIO(content_bytes)):
                 is_pil = True
         except UnidentifiedImageError:
             is_pil = False
 
-        # --- Erst-Extraktion der 64x64 Vergleichsbilder ---
+        # 4. Vorbereitung (FFmpeg oder PIL Extraktion)
         if not is_pil:
             click.echo(f"[INFO] Video detected. Extracting 64x64 thumbnails via FFmpeg...")
             in_path = repo_tmp_dir / f"vid_{label}"
@@ -962,8 +982,6 @@ def video_similarity_calibration(
             bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
             ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
-            # Wir lassen FFmpeg IMMER die Arbeit machen (64x64, Graustufen)
-            # Das spart massiv Zeit beim Schreiben/Lesen
             out_pattern = str(repo_tmp_dir / f"small_{label}_%05d.jpg")
             subprocess.run([
                 ffmpeg_exe, "-y", "-i", str(in_path), 
@@ -975,35 +993,31 @@ def video_similarity_calibration(
             if in_path.exists(): in_path.unlink()
 
             if not no_cache:
-                # Normaler Modus: In den RAM laden und Dateien sofort löschen
                 click.echo("[INFO] Caching thumbnails to RAM...")
                 temp_files = sorted(repo_tmp_dir.glob(f"small_{label}_*.jpg"))
                 for p in temp_files:
                     with Image.open(p) as tmp_img:
-                        # .copy() stellt sicher, dass das Bild im RAM bleibt, 
-                        # auch wenn die Datei geschlossen wird
                         ram_cache.append(tmp_img.copy())
                     p.unlink()
-            else:
-                click.echo("[INFO] Using disk-based cache (--no-cache).")
             
             click.echo("[INFO] Preparation complete.")
-            
         else:
-            # PIL Animation (GIF etc)
             with Image.open(BytesIO(content_bytes)) as container:
                 for i in range(getattr(container, "n_frames", 1)):
                     container.seek(i)
                     small = container.convert("L").resize((64, 64))
                     ram_cache.append(small)
 
+        # 5. Calibration Loop
         similarity_list = [float(s.strip()) for s in similarity.split(",") if s.strip()]
 
-        # --- Calibration Loop ---
         for thr in similarity_list:
+            if thr in already_tested:
+                click.echo(f"[SKIP] Threshold {thr} already processed (selected {already_tested[thr]}).")
+                continue
+
             click.echo(f"\n[TESTING] Similarity Threshold: {thr}")
             
-            # Generator für die 64x64 Bilder (entweder aus RAM oder von Disk)
             if no_cache and not is_pil:
                 source_files = sorted(repo_tmp_dir.glob(f"small_{label}_*.jpg"))
                 frame_gen = (Image.open(p) for p in source_files)
@@ -1047,40 +1061,38 @@ def video_similarity_calibration(
                     
                     if no_cache: small_img.close()
 
+            # Ergebnis speichern
             with open(summary_file, "a", encoding="utf-8") as sf:
                 sf.write(f"Threshold {thr}: selected {current_kept} frames (from {current_total})\n")
 
             click.echo(f"[RESULT] Threshold {thr}: {current_kept} frames selected.")
             processed_count += 1
+            
+            # Wenn nur noch 1 Frame übrig ist (der erste), macht weitermachen keinen Sinn
             if current_kept <= 1:
-                click.echo("[INFO] Stop: Threshold too high.")
+                click.echo("[INFO] Stop: Threshold too high (selected <= 1).")
                 break
 
     except KeyboardInterrupt:
         interrupted = True
         click.echo("\n[!] Interrupted by user (Ctrl+C)")
-        logging.warning("=== INTERRUPTED BY USER (CTRL+C) ===")
-
+    except Exception as e:
+        click.echo(f"\n[ERROR] {e}")
     finally:
-        # Cleanup der 64x64 Disk-Frames falls no-cache genutzt wurde
         if no_cache:
             click.echo("[INFO] Cleaning up 64x64 cache frames...")
             for p in repo_tmp_dir.glob(f"small_{label}_*.jpg"):
                 try: p.unlink()
                 except Exception: pass
 
-        logging.info("=== WD HYDRUS VIDEO CALIBRATION FINISHED ===")
         logging.shutdown()
-        click.echo(f"\nFinished. Thresholds processed: {processed_count}")
+        click.echo(f"\nFinished. New thresholds processed: {processed_count}")
 
         if debug:
             try:
                 click.echo("Debug mode: press Enter to exit.")
                 input()
             except Exception: pass
-
-
-
 
 
 if __name__ == '__main__':
