@@ -874,7 +874,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 pass
 
 
-# curently broken x2
 @click.command(name="video_similarity_calibration")
 @click.option("--file-hash", help="Hydrus file hash to fetch (mutually exclusive with --local-file)")
 @click.option("--local-file", help="Path to a local video file (mutually exclusive with --file-hash)")
@@ -893,185 +892,187 @@ def video_similarity_calibration(
     max_frames: int,
     debug: bool
 ) -> None:
-    """Calibration helper: determine optimal similarity thresholds while monitoring memory usage.
+    # --- State Variables ---
+    processed_count = 0  # Hier: Anzahl der erfolgreich getesteten Thresholds
+    interrupted = False
+    client = None
+    total_video_frames = 0
+    content_bytes: bytes = b""
+    label: str = ""
+    is_pil = False
 
-    Fetches a video (Hydrus by hash or local file), extracts frames, runs
-    _select_frames_streaming for each similarity threshold, and logs results.
-    Outputs a summary file in `ffmpeg_temp` with frame selection counts.
-
-    This never sends tags back to Hydrus.
-    """
-
-
-    content_bytes: bytes
-    label: str
-
-    # --- Fetch content ---
-    if file_hash:
-        click.echo(f"[INFO] Fetching video from Hydrus with hash {file_hash}")
-        logging.info(f"Fetching video from Hydrus: {file_hash}")
-        client = hydrus_api.Client(token, host)
-        response = get_file_with_retry(client, file_hash)
-        content_bytes = response.content
-        label = file_hash
-        click.echo(f"[INFO] Retrieved video of size {len(content_bytes)} bytes")
-    elif local_file:
-        p = Path(local_file)
-        click.echo(f"[INFO] Reading local file {local_file}")
-        logging.info(f"Reading local file: {local_file}")
-        content_bytes = p.read_bytes()
-        label = p.stem
-        click.echo(f"[INFO] Local file size: {len(content_bytes)} bytes")
-    else:
-        raise ValueError("Provide --file-hash or --local-file")
-
-    # --- Setup logging ---
-    os.makedirs("logs", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    logfile = f"logs/vsc_{timestamp}_{label}.log"
-
-    logging.basicConfig(
-        filename=logfile,
-        level=logging.INFO if not debug else logging.DEBUG,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-    click.echo(f"[INFO] Logging to {logfile}")
-
-    # --- Parse similarity thresholds ---
-    similarity_list = [float(s.strip()) for s in similarity.split(",") if s.strip()]
-    click.echo(f"[INFO] Similarity thresholds to test: {similarity_list}")
-    logging.info(f"Similarity thresholds: {similarity_list}")
-
-    # --- Prepare repository temp folder ---
+    # Pfade vorbereiten
     repo_root = Path(__file__).resolve().parents[1]
     repo_tmp_dir = repo_root / "ffmpeg_temp"
     repo_tmp_dir.mkdir(parents=True, exist_ok=True)
-    click.echo(f"[INFO] Temporary output directory: {repo_tmp_dir}")
 
-    # --- Frame generator ---
-    @profile(stream=memory_profiler_logg)
-    def pil_gen(data: bytes):
-        """Yield frames from video or animated image, resized to 320x320."""
-        click.echo(f"[INFO] Starting frame extraction...")
-
-        # Try animated image first (GIF/WebP/etc.)
-        try:
-            img = Image.open(BytesIO(data))
-            if getattr(img, "is_animated", False) or getattr(img, "n_frames", 1) > 1:
-                click.echo("[INFO] Detected animated image. Extracting frames...")
-                for i in range(getattr(img, "n_frames", 1)):
-                    img.seek(i)
-                    yield img.convert("RGB")
-                img.close()
-                click.echo("[INFO] Completed frame extraction from animated image.")
+    try:
+        # 1. Daten und Metadaten beschaffen
+        if file_hash:
+            client = hydrus_api.Client(token, host)
+            try:
+                metadata = client.get_file_metadata(hashes=[file_hash])
+                total_video_frames = metadata[0].get('num_frames', 0)
+                click.echo(f"[INFO] Fetching video from Hydrus: {file_hash}")
+                response = get_file_with_retry(client, file_hash)
+                content_bytes = response.content
+                label = file_hash
+            except Exception as e:
+                click.echo(f"Error fetching from Hydrus: {e}")
                 return
-            img.close()
-        except Exception as e:
-            click.echo(f"[DEBUG] Not an animated image: {e}")
+        elif local_file:
+            p = Path(local_file)
+            if not p.exists():
+                click.echo(f"[ERROR] Local file not found: {local_file}")
+                return
+            content_bytes = p.read_bytes()
+            label = p.stem
+            total_video_frames = 0
+        else:
+            raise ValueError("Provide --file-hash or --local-file")
 
-        # Assume video, use ffmpeg streaming
-        bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == 'nt' else "ffmpeg")
-        ffmpeg_cmd = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
-        click.echo(f"[INFO] Using ffmpeg command: {ffmpeg_cmd}")
+        summary_file = repo_tmp_dir / f"summary_{label}.txt"
 
-        width = 320
-        height = 320
-        frame_size = width * height * 3
-        cmd = [
-            ffmpeg_cmd,
-            "-i", "pipe:0",
-            "-vf", f"scale={width}:{height}",
-            "-f", "image2pipe",
-            "-pix_fmt", "rgb24",
-            "-vcodec", "rawvideo",
-            "-"
-        ]
-        click.echo(f"[DEBUG] ffmpeg command: {' '.join(cmd)}")
+        # Header in Summary schreiben
+        with open(summary_file, "w", encoding="utf-8") as sf:
+            sf.write(f"Calibration for: {label}\n")
+            sf.write(f"Total File frames: {total_video_frames}\n")
+            click.echo(f"[INFO] Total File frames: {total_video_frames}")
+            sf.write("-" * 30 + "\n")
 
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
+        # --- Frame Generator Logik ---
+        @profile(stream=memory_profiler_logg)
+        def pil_frame_gen(data: bytes):
+            with Image.open(BytesIO(data)) as container:
+                n = getattr(container, "n_frames", 1)
+                for i in range(n):
+                    container.seek(i)
+                    yield container.convert("RGB").resize((448, 448))
 
+        @profile(stream=memory_profiler_logg)
+        def ffmpeg_frame_gen_cached(h: str, tmp_dir: Path):
+            frame_files = sorted(tmp_dir.glob(f"frame_{h}_*.jpg"))
+            for p in frame_files:
+                with Image.open(p) as f_img:
+                    yield f_img.convert("RGB").resize((448, 448))
+
+        # Check ob PIL oder FFmpeg
         try:
-            proc.stdin.write(data) # pyright: ignore[reportOptionalMemberAccess]
-            proc.stdin.close() # pyright: ignore[reportOptionalMemberAccess]
-            frame_count = 0
+            with Image.open(BytesIO(content_bytes)):
+                is_pil = True
+        except UnidentifiedImageError:
+            is_pil = False
 
-            while True:
-                raw = proc.stdout.read(frame_size) # pyright: ignore[reportOptionalMemberAccess]
-                if len(raw) != frame_size:
-                    break
-                frame = Image.frombytes("RGB", (width, height), raw)
-                frame_count += 1
-                yield frame
+        if not is_pil:
+            click.echo("[INFO] Video detected. Running one-time FFmpeg extraction...")
+            in_path = repo_tmp_dir / f"vid_{label}"
+            in_path.write_bytes(content_bytes)
+            out_pattern = str(repo_tmp_dir / f"frame_{label}_%05d.jpg")
+            
+            bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+            ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
-            click.echo(f"[INFO] Extracted {frame_count} frames from video stream")
-        finally:
-            proc.stdout.close() # pyright: ignore[reportOptionalMemberAccess]
-            proc.wait()
-            click.echo("[INFO] ffmpeg process finished")
+            subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "2", out_pattern],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if in_path.exists(): in_path.unlink()
+            click.echo("[INFO] Extraction complete.")
 
-    # --- Run calibration ---
-    click.echo(f"[INFO] Starting calibration for {label}")
-    for thr in similarity_list:
-        click.echo(f"[INFO] Processing similarity threshold: {thr}")
-        selected = _select_frames_streaming( # pyright: ignore[reportUndefinedVariable]
-            pil_gen(content_bytes),
-            similarity_threshold=thr,
-            max_frames=max_frames
-        )
-        click.echo(f"[RESULT] Threshold {thr}: selected {len(selected)} frames")
-        logging.info(f"Threshold {thr}: selected {len(selected)} frames")
+        # Generator-Factory Setup
+        if is_pil:
+            frame_gen_factory = lambda: pil_frame_gen(content_bytes)
+        else:
+            frame_gen_factory = lambda: ffmpeg_frame_gen_cached(label, repo_tmp_dir)
 
-        # Log summary
-        try:
-            summary_file = repo_tmp_dir / f"summary_{label}.txt"
+        similarity_list = [float(s.strip()) for s in similarity.split(",") if s.strip()]
+
+        # --- Calibration Loop ---
+        for thr in similarity_list:
+            click.echo(f"\n[TESTING] Similarity Threshold: {thr}")
+            current_frame_gen = frame_gen_factory()
+            
+            current_total = 0
+            current_kept = 0
+            selected_frames = []
+            last_small = None
+
+            def progress_label(item):
+                return f"Frame:{current_total}/{total_video_frames} Kept:{current_kept}"
+
+            with click.progressbar(
+                current_frame_gen,
+                length=total_video_frames,
+                label=f"Calibration (Thr {thr})",
+                item_show_func=progress_label
+            ) as bar:
+                for img in bar:
+                    current_total += 1
+                    bar.update(0)
+
+                    small = img.resize((64, 64)).convert("L")
+                    keep = False
+                    if last_small is None:
+                        keep = True
+                    else:
+                        diff = ImageChops.difference(small, last_small)
+                        stat = ImageStat.Stat(diff)
+                        mean_diff = sum(stat.mean) / len(stat.mean)
+                        if mean_diff >= thr:
+                            keep = True
+
+                    if keep:
+                        current_kept += 1
+                        last_small = small
+                        selected_frames.append(img)
+                        if max_frames > 0 and len(selected_frames) >= max_frames:
+                            break
+                    else:
+                        img.close()
+
             with open(summary_file, "a", encoding="utf-8") as sf:
-                sf.write(f"Threshold {thr}: selected {len(selected)} frames\n")
-            click.echo(f"[INFO] Written summary for threshold {thr}")
-        except Exception as e:
-            click.echo(f"[WARNING] Could not write summary: {e}")
+                sf.write(f"Threshold {thr}: selected {len(selected_frames)} frames (from {current_total})\n")
 
-        # Clean up frames
-        for f in selected: 
-            f.close()
+            click.echo(f"[RESULT] Threshold {thr}: {len(selected_frames)} frames selected.")
+            for f in selected_frames: f.close()
+            processed_count += 1
 
-        if len(selected) <= 1:
-            click.echo("[INFO] Early exit: fewer than 2 frames selected")
-            break
+            if len(selected_frames) <= 1:
+                click.echo("[INFO] Stop: Threshold too high.")
+                break
 
-    click.echo(f"[INFO] Calibration artifacts written to: {repo_tmp_dir}")
-    logging.info("Calibration complete.")
+    except KeyboardInterrupt:
+        interrupted = True
+        click.echo("\n[!] Interrupted by user (Ctrl+C)")
+        logging.warning("=== INTERRUPTED BY USER (CTRL+C) ===")
 
+    finally:
+        # --- Cleanup Frames ---
+        if not is_pil:
+            click.echo("[INFO] Cleaning up temporary frames...")
+            for p in repo_tmp_dir.glob(f"frame_{label}_*.jpg"):
+                try:
+                    p.unlink()
+                except Exception: pass
 
-# =============================================================================================================================================
-# legacy versions of select_frames, batch_video and similarity_calibration functions 
-# are kept below for reference, testing and comparison purposes, 
-# but should not be used in the main command flow. 
+        logging.info("=== WD HYDRUS VIDEO CALIBRATION FINISHED ===")
+        logging.info(f"Total thresholds tested: {processed_count}")
 
-# the new streaming versions are designed to be more memory efficient 
-# and should be used in the main video batch command to avoid memory issues with long videos.
+        if interrupted:
+            logging.info("Run ended due to manual interruption.")
+        else:
+            logging.info("Run completed normally.")
 
+        logging.shutdown()
+        click.echo(f"\nFinished. Thresholds processed: {processed_count}")
 
-# f me i hate this code so much
-# (╯°□°)╯︵ ┻━┻
+        if debug:
+            try:
+                click.echo("Debug mode: press Enter to exit.")
+                input()
+            except Exception:
+                pass
 
+# =====================================================================================================================
 
-# float=
-# similarity threshold for frame selection. Adjust to make filtering more or less aggressive.
-# the default value of 12.0 was chosen based on some testing using using legacy_video_similarity_calibration,
-# to avrage around the point where a speed gain would decrease and tag quality would start to noticeably degrade for some videos.
-# but the optimal threshold may vary depending on the specific videos being processed and the desired balance between tag accuracy and processing efficiency.
-# Depending on the content and frame rate of the videos being processed, users may want to adjust this threshold up or down.
-# A lower threshold will keep more frames (including those with minor differences), 
-# while a higher threshold will be more selective and keep only frames that are more visually distinct from the last-kept frame.
-
-# max_frames=
-# 0 means no limit; set to a positive integer to keep only the first N sufficiently different frames.
-@profile(stream=memory_profiler_logg)
 def _Legacy_select_frames_from_images(images: list[PILImage], similarity_threshold: float = 12.0, max_frames: int = 0) -> list[PILImage]:
     """Select a subset of frames from a sequence by simple similarity filtering.
 
