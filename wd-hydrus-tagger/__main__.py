@@ -441,6 +441,8 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 def process_frames_streaming(
     frame_generator: Iterator[PILImage],
     interrogator,
+    client,
+    file_hash: str,
     similarity_threshold: float,
     threshold: float,
     ratingsflag: bool,
@@ -457,14 +459,22 @@ def process_frames_streaming(
     kept_count = 0
     total_count = 0
 
+    # Get total frames from API
+    metadata = client.get_file_metadata(hashes=[file_hash])
+    total_video_frames = metadata[0].get('num_frames', 0)
+
     with click.progressbar(
         frame_generator,
-        label="Streaming & Tagging Frames",
-        show_pos=True,
+        length=total_video_frames,
+        label="Filtering & Tagging Frames",
+        show_pos=False, # We disable show_pos because we are showing it in item_show_func
+        item_show_func=lambda _: f"Frame:{total_count}/{total_video_frames} Tagged:{kept_count}"
     ) as bar:
 
         for img in bar:
             total_count += 1
+            # Update the bar text every iteration
+            bar.update(0) 
 
             # similarity check
             small = img.resize((64, 64)).convert("L")
@@ -483,6 +493,7 @@ def process_frames_streaming(
                 img.close()
                 continue
 
+            # Frame is being kept/tagged
             kept_count += 1
             last_small = small
 
@@ -675,8 +686,20 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 if not using_tag_search and file_hash in done_hashes:
                     continue
 
-                click.echo("\n  processing: " + file_hash)
-                logging.info(f"Processing: {file_hash}")
+                metadata = client.get_file_metadata(hashes=[file_hash])
+                file_info = metadata[0] # The API returns a list of metadata objects
+
+                # Extract the number of frames
+                # It will be None or absent for static images, so use .get()
+                num_frames = file_info.get('num_frames')
+
+                if num_frames:
+                    click.echo(f"\n  Processing {num_frames} frames for hash {file_hash}")
+                    logging.info(f"Processing {num_frames} frames for hash {file_hash}")
+                else:
+                    click.echo(f"\n  File {file_hash} is a static image or has no frame count.")
+                    logging.info(f"File {file_hash} is a static image or has no frame count.")
+
 
                 try:
                     response: Any = get_file_with_retry(client, file_hash)
@@ -713,7 +736,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             container.seek(i)
                             count += 1
                             yield container.convert("RGB").resize((448, 448))
-                    click.echo(f"\n[pil] Total frames extracted: {count}")
                     logging.info(f"[pil] Total frames extracted: {count} for {file_hash}")
 
                 @profile(stream=memory_profiler_logg)
@@ -727,36 +749,15 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
                     ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
-
-                    if debug:
-                        subprocess.run(
-                            [
-                                ffmpeg_exe,
-                                "-y",
-                                "-i", str(in_path),
-                                "-vf", "fps=1",
-                                "-q:v", "2",
-                                out_pattern
-                            ],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            check=False
-                        )
-                        click.echo()
-                        click.echo("ffmpeg done")
-                        click.echo()
-                    else:
-                        subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "2", out_pattern],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                    subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "2", out_pattern],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                     
-
                     for p in sorted(tmp_dir.glob(f"frame_{h}_*.jpg")):
                         with Image.open(p) as f_img:
                             count += 1
                             yield f_img.convert("RGB").resize((448, 448))  # Resize for faster processing; adjust as needed
                         p.unlink()
                     if in_path.exists(): in_path.unlink()
-                    click.echo(f"\n[ffmpeg] Total frames extracted: {count}")
                     logging.info(f"[ffmpeg] Total frames extracted: {count} for {file_hash}")
 
                 repo_root = Path(__file__).resolve().parents[1]
@@ -777,12 +778,18 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     frame_gen = ffmpeg_frame_gen(response.content, file_hash, repo_tmp_dir)
 
                 agg_scores, agg_ratings, kept_frames, total_frames = process_frames_streaming(
-                    frame_gen,
-                    interrogator,
+                    frame_generator=frame_gen,
+                    interrogator=interrogator,
+                    client=client,
+                    file_hash=file_hash,
                     similarity_threshold=similarity_threshold_ff,
                     threshold=threshold,
                     ratingsflag=modelinfo['ratingsflag'],
                 )
+
+
+
+
 
                 click.echo(f"Similarity threshold > {similarity_threshold_ff:.2f}")
                 click.echo(f"Kept and tagged {kept_frames} of {total_frames} frames")
