@@ -43,6 +43,8 @@ import gc
 
 
 
+
+
 # The memory_profiler import and setup is included here in the main module so that it can be used across all commands, 
 # including the video batch command which is where memory usage is more of a concern. 
 # The memory_profiler will log detailed memory usage information to a timestamped log file in the logs directory, 
@@ -341,7 +343,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
                 try:
                     image: PILImage = Image.open(image_bytes)
-                    image = image.convert("RGB")
+                    image = image.convert("RGB").resize((448, 448))
                 except (UnidentifiedImageError, OSError):
                     click.echo(f"Skipping unreadable or non-image file: {file_hash}")
                     logging.warning(f"Skipping unreadable or non-image file: {file_hash}")
@@ -435,64 +437,71 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 # new frame logic
 # =============================================================================================================================================
 
-# dont remeber why this wrapper is needed but keeping it just in case, also it has the profile decorator for memory logging
 @profile(stream=memory_profiler_logg)
-def _get_frames_generator(images_source):
-    """This helper function yields frames one at a time from the source, allowing for memory-efficient processing."""
-    for img in images_source:
-        yield img
-        # The frame will be closed in the calling loop after it is processed.
-
-
-
-# float=
-# ! DO NOT EDIT IT HERE ! as its overridden for/below pil_frame_gen and ffmpeg_frame_gen 
-# so edit ther instead if you want to change the default threshold for frame selection.
-
-# similarity threshold for frame selection. Adjust to make filtering more or less aggressive.
-# A lower threshold will keep more frames (including those with minor differences) and use more RAM, 
-# while a higher threshold will be more selective and keep only frames that are more visually distinct from the last-kept frame (and use less RAM).
-
-# max_frames=
-# 0 means no limit; set to a positive integer to keep only the first N sufficiently different frames.
-@profile(stream=memory_profiler_logg)
-def _select_frames_streaming(frame_generator: Iterator[PILImage], similarity_threshold: float = 50.0, max_frames: int = 0) -> list[PILImage]:
-    """Optimized frame selection directly from a generator to save RAM.
-    Rejected frames are closed immediately.
+def process_frames_streaming(
+    frame_generator: Iterator[PILImage],
+    interrogator,
+    similarity_threshold: float,
+    threshold: float,
+    ratingsflag: bool,
+):
     """
-    selected: list[PILImage] = []
-    last_small: Optional[PILImage] = None
-    
-    for img in frame_generator:
-        # Create small grayscale version for comparison on-the-fly
-        small = img.resize((64, 64)).convert("L")
-        
-        keep_frame = False
-        if last_small is None:
-            keep_frame = True
-        else:
-            diff = ImageChops.difference(small, last_small)
-            stat = ImageStat.Stat(diff)
-            mean_diff = sum(stat.mean) / len(stat.mean)
-            if mean_diff >= similarity_threshold:
-                keep_frame = True
-        
-        if keep_frame:
-            selected.append(img)
-            last_small = small
-            if max_frames > 0 and len(selected) >= max_frames:
-                break
-        else:
-            # Important: Close immediately if not kept
-            img.close()
-            
-    return selected
+    True streaming frame processor with live progress bar.
+    No frame list is stored.
+    """
 
-# dont remeber why this wrapper is needed but keeping it just in case, also it has the profile decorator for memory logging
-@profile(stream=memory_profiler_logg)
-def _select_frames_from_images(images: list[PILImage], similarity_threshold: float = 12.0, max_frames: int = 0):
-    """Legacy wrapper modified to use streaming logic for memory efficiency."""
-    return _select_frames_streaming(iter(images), similarity_threshold, max_frames)
+    agg_scores: dict[str, float] = {}
+    agg_ratings: dict[str, float] = {}
+
+    last_small: Optional[PILImage] = None
+    kept_count = 0
+    total_count = 0
+
+    with click.progressbar(
+        frame_generator,
+        label="Streaming & Tagging Frames",
+        show_pos=True,
+    ) as bar:
+
+        for img in bar:
+            total_count += 1
+
+            # similarity check
+            small = img.resize((64, 64)).convert("L")
+
+            keep_frame = False
+            if last_small is None:
+                keep_frame = True
+            else:
+                diff = ImageChops.difference(small, last_small)
+                stat = ImageStat.Stat(diff)
+                mean_diff = sum(stat.mean) / len(stat.mean)
+                if mean_diff >= similarity_threshold:
+                    keep_frame = True
+
+            if not keep_frame:
+                img.close()
+                continue
+
+            kept_count += 1
+            last_small = small
+
+            ratings, tags = interrogator.interrogate(img)
+
+            for t, s in tags.items():
+                score = float(s)
+                if score > threshold:
+                    agg_scores[t] = max(agg_scores.get(t, 0.0), score)
+
+            if ratingsflag:
+                for r, s in ratings.items():
+                    score = float(s)
+                    if score > threshold:
+                        agg_ratings[r] = max(agg_ratings.get(r, 0.0), score)
+
+            img.close()
+
+    return agg_scores, agg_ratings, kept_count, total_count
 
 # =============================================================================================================================================
 # new evaluate_api_batch_video and video_similarity_calibration
@@ -703,8 +712,8 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                         for i in range(n):
                             container.seek(i)
                             count += 1
-                            yield container.convert("RGB")
-                    click.echo(f"[pil] Total frames extracted: {count}")
+                            yield container.convert("RGB").resize((448, 448))
+                    click.echo(f"\n[pil] Total frames extracted: {count}")
                     logging.info(f"[pil] Total frames extracted: {count} for {file_hash}")
 
                 @profile(stream=memory_profiler_logg)
@@ -720,8 +729,19 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
 
                     if debug:
-                        subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "2", out_pattern],
-                                check=False)
+                        subprocess.run(
+                            [
+                                ffmpeg_exe,
+                                "-y",
+                                "-i", str(path),
+                                "-vf", "fps=1",
+                                "-q:v", "2",
+                                out_pattern
+                            ],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False
+                        )
                         click.echo()
                         click.echo("ffmpeg done")
                         click.echo()
@@ -736,56 +756,39 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             yield f_img.convert("RGB").resize((448, 448))  # Resize for faster processing; adjust as needed
                         p.unlink()
                     if in_path.exists(): in_path.unlink()
-                    click.echo(f"[ffmpeg] Total frames extracted: {count}")
+                    click.echo(f"\n[ffmpeg] Total frames extracted: {count}")
                     logging.info(f"[ffmpeg] Total frames extracted: {count} for {file_hash}")
 
                 repo_root = Path(__file__).resolve().parents[1]
                 repo_tmp_dir = repo_root / "ffmpeg_temp"
                 repo_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-                try:
-                    # Attempt PIL (GIF/APNG)
-                    similarity_threshold_ff = 12.0
-                    selected = _select_frames_streaming(pil_frame_gen(response.content),similarity_threshold=similarity_threshold_ff)
-                except Exception:
-                    # Fallback to FFmpeg (Videos)
-                    similarity_threshold_ff = 12.0
-                    selected = _select_frames_streaming(ffmpeg_frame_gen(response.content, file_hash, repo_tmp_dir),similarity_threshold=similarity_threshold_ff)
 
-                if not selected:
-                    logging.warning(f"No frames selected for {file_hash}")
-                    continue
+
+                similarity_threshold_ff = 12.0
+
+                try:
+                    # Test open once to verify it is PIL-compatible
+                    test_img = Image.open(BytesIO(response.content))
+                    test_img.close()
+                    frame_gen = pil_frame_gen(response.content)
+                except UnidentifiedImageError:
+                    # Not an image container > use ffmpeg
+                    frame_gen = ffmpeg_frame_gen(response.content, file_hash, repo_tmp_dir)
+
+                agg_scores, agg_ratings, kept_frames, total_frames = process_frames_streaming(
+                    frame_gen,
+                    interrogator,
+                    similarity_threshold=similarity_threshold_ff,
+                    threshold=threshold,
+                    ratingsflag=modelinfo['ratingsflag'],
+                )
 
                 click.echo(f"Similarity threshold > {similarity_threshold_ff:.2f}")
-                click.echo(f"kept frames {len(selected)} frames")
-                logging.info(f"Similarity threshold > {similarity_threshold_ff:.2f} = kept frames {len(selected)} frames for {file_hash}")
-                logging.info(f"kept frames {len(selected)} frames for {file_hash}")
-                
-                agg_scores: dict[str, float] = {}
-                agg_ratings: dict[str, float] = {}
-
-
-                counterx = 0
-                totalx = len(selected)
-                @profile(stream=memory_profiler_logg)
-                def _show_idx(item) -> str:
-                    return f"{counterx}/{totalx}"
-
-                with click.progressbar(selected, label="Tagging frames", item_show_func=_show_idx) as pbar:
-                    for frame in pbar:
-                        counterx += 1
-                        ratings, tags = interrogator.interrogate(frame)
-                        #for t, s in tags.items(): agg_scores[t] = agg_scores.get(t, 0.0) + float(s)
-                        for t, s in tags.items(): agg_scores[t] = max(agg_scores.get(t, 0.0), float(s))
-                        #for r, s in ratings.items(): agg_ratings[r] = agg_ratings.get(r, 0.0) + float(s)
-                        for r, s in ratings.items(): agg_ratings[r] = max(agg_ratings.get(r, 0.0), float(s))
-                        frame.close() # Close frame immediately after interrogation
-                click.echo("===============================================================================")
+                click.echo(f"Kept and tagged {kept_frames} of {total_frames} frames")
+                logging.info(f"Similarity threshold > {similarity_threshold_ff:.2f}")
+                logging.info(f"Kept and tagged {kept_frames} of {total_frames} frames for {file_hash}")
                 click.echo()
-
-                # Average scores
-                #for k in agg_scores: agg_scores[k] /= total_selected
-                #for k in agg_ratings: agg_ratings[k] /= total_selected
 
                 rating_priority = {
                 "explicit": 4,
@@ -804,21 +807,25 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             rating = r
 
 
-
-                #rating = "none"
-                #if modelinfo['ratingsflag']:
-                #    agg_ratings.setdefault("none", 0.0)
-                #    for k in agg_ratings:
-                #        if agg_ratings[k] > agg_ratings[rating]: rating = k
-
                 clipped_tags = [k.replace("_", " ") if k not in kaomojis else k for k, v in agg_scores.items() if v > threshold]
-                if modelinfo['ratingsflag']: clipped_tags.append(f"rating:{rating}")
+
+                if not privacy:
+                    click.echo("rating: " + rating)
+                    click.echo("tags: " + ", ".join(clipped_tags))
+                    click.echo()
+
+                if modelinfo['ratingsflag']:
+                    clipped_tags.append("rating:" + rating)
+
+                
                 clipped_tags.append(f"{modelinfo['modelname']} ai generated tags")
 
-                client.add_tags(hashes=[file_hash], service_names_to_tags={tag_service: clipped_tags})
+
+                client.add_tags(
+                    hashes=[file_hash], 
+                    service_names_to_tags={tag_service: clipped_tags})
 
                 processed_count += 1
-                del selected, agg_scores, agg_ratings, clipped_tags, response
                 gc.collect()
 
 
@@ -935,6 +942,7 @@ def video_similarity_calibration(
     click.echo(f"[INFO] Temporary output directory: {repo_tmp_dir}")
 
     # --- Frame generator ---
+    @profile(stream=memory_profiler_logg)
     def pil_gen(data: bytes):
         """Yield frames from video or animated image, resized to 320x320."""
         click.echo(f"[INFO] Starting frame extraction...")
