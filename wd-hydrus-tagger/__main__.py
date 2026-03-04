@@ -733,7 +733,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             [
                                 ffmpeg_exe,
                                 "-y",
-                                "-i", str(path),
+                                "-i", str(in_path),
                                 "-vf", "fps=1",
                                 "-q:v", "2",
                                 out_pattern
@@ -1011,7 +1011,7 @@ def video_similarity_calibration(
     click.echo(f"[INFO] Starting calibration for {label}")
     for thr in similarity_list:
         click.echo(f"[INFO] Processing similarity threshold: {thr}")
-        selected = _select_frames_streaming(
+        selected = _select_frames_streaming( # pyright: ignore[reportUndefinedVariable]
             pil_gen(content_bytes),
             similarity_threshold=thr,
             max_frames=max_frames
