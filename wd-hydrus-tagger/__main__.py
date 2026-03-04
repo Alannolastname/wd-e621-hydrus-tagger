@@ -43,8 +43,6 @@ import gc
 
 
 
-
-
 # The memory_profiler import and setup is included here in the main module so that it can be used across all commands, 
 # including the video batch command which is where memory usage is more of a concern. 
 # The memory_profiler will log detailed memory usage information to a timestamped log file in the logs directory, 
@@ -58,6 +56,8 @@ except ImportError:
     def profile(stream=None):
         return lambda f: f
     
+
+
 # Logging Setup for memory profiler (separate from the main logging used for command progress and info)
 os.makedirs("logs", exist_ok=True)
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -65,9 +65,11 @@ memory_profiler_logg_shrug = f"logs/memory_profiler_{timestamp}.log"
 memory_profiler_logg = open(memory_profiler_logg_shrug, "w")  # Open the log file for writing memory profiler output
 
 
+
 # Global settings for PIL
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 
 
 # -----------------------------
@@ -110,6 +112,7 @@ def get_file_with_retry(client: hydrus_api.Client, file_hash: str, retries: int 
             raise
 
 
+
 kaomojis: list[str] = [
     "0_0",
     "(o)_(o)",
@@ -133,6 +136,7 @@ kaomojis: list[str] = [
 ]
 
 
+
 @click.group()
 @profile(stream=memory_profiler_logg)
 def cli():
@@ -143,6 +147,7 @@ def cli():
     group at runtime.
     """
     pass
+
 
 
 @click.command()
@@ -434,8 +439,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                 # If stdin is not available, ignore and continue exiting
                 pass
 
-# new frame logic
-# =============================================================================================================================================
+
 
 @profile(stream=memory_profiler_logg)
 def process_frames_streaming(
@@ -514,8 +518,7 @@ def process_frames_streaming(
 
     return agg_scores, agg_ratings, kept_count, total_count
 
-# =============================================================================================================================================
-# new evaluate_api_batch_video and video_similarity_calibration
+
 
 @click.command()
 @click.option("--hashfile", help="Text file containing Hydrus hashes")
@@ -874,6 +877,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 pass
 
 
+
 @click.command(name="video_similarity_calibration")
 @click.option("--file-hash", help="Hydrus file hash to fetch (mutually exclusive with --local-file)")
 @click.option("--local-file", help="Path to a local video file (mutually exclusive with --file-hash)")
@@ -881,6 +885,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 @click.option("--host", default="http://127.0.0.1:45869", help="Hydrus host (used with --file-hash)")
 @click.option("--similarity", default="10.0,9.0,8.0,7.0,6.0,5.0,4.0,3.0,2.0,1.0", help="Comma-separated similarity thresholds to test, e.g. '10.0,9.0,8.0'")
 @click.option("--max-frames", default=0, type=int, help="Maximum frames to keep per threshold (0 = unlimited)")
+@click.option("--no-cache", is_flag=True, default=False, help="Store 64x64 frames on disk instead of RAM")
 @click.option("--debug", is_flag=True, default=False, help="Show debug output and keep extracted frames")
 @profile(stream=memory_profiler_logg)
 def video_similarity_calibration(
@@ -890,24 +895,26 @@ def video_similarity_calibration(
     host: str,
     similarity: str,
     max_frames: int,
+    no_cache: bool,
     debug: bool
 ) -> None:
     # --- State Variables ---
-    processed_count = 0  # Hier: Anzahl der erfolgreich getesteten Thresholds
+    processed_count = 0
     interrupted = False
     client = None
     total_video_frames = 0
     content_bytes: bytes = b""
     label: str = ""
     is_pil = False
+    
+    # Der Cache speichert nur die winzigen 64x64 Graustufen-Bilder
+    ram_cache: list[PILImage] = []
 
-    # Pfade vorbereiten
     repo_root = Path(__file__).resolve().parents[1]
     repo_tmp_dir = repo_root / "ffmpeg_temp"
     repo_tmp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # 1. Daten und Metadaten beschaffen
         if file_hash:
             client = hydrus_api.Client(token, host)
             try:
@@ -932,88 +939,95 @@ def video_similarity_calibration(
             raise ValueError("Provide --file-hash or --local-file")
 
         summary_file = repo_tmp_dir / f"summary_{label}.txt"
-
-        # Header in Summary schreiben
         with open(summary_file, "w", encoding="utf-8") as sf:
             sf.write(f"Calibration for: {label}\n")
             sf.write(f"Total File frames: {total_video_frames}\n")
             click.echo(f"[INFO] Total File frames: {total_video_frames}")
             sf.write("-" * 30 + "\n")
 
-        # --- Frame Generator Logik ---
-        @profile(stream=memory_profiler_logg)
-        def pil_frame_gen(data: bytes):
-            with Image.open(BytesIO(data)) as container:
-                n = getattr(container, "n_frames", 1)
-                for i in range(n):
-                    container.seek(i)
-                    yield container.convert("RGB").resize((448, 448))
-
-        @profile(stream=memory_profiler_logg)
-        def ffmpeg_frame_gen_cached(h: str, tmp_dir: Path):
-            frame_files = sorted(tmp_dir.glob(f"frame_{h}_*.jpg"))
-            for p in frame_files:
-                with Image.open(p) as f_img:
-                    yield f_img.convert("RGB").resize((448, 448))
-
-        # Check ob PIL oder FFmpeg
+        # Check ob PIL (GIF/APNG) oder Video
         try:
             with Image.open(BytesIO(content_bytes)):
                 is_pil = True
         except UnidentifiedImageError:
             is_pil = False
 
+        # --- Erst-Extraktion der 64x64 Vergleichsbilder ---
         if not is_pil:
-            click.echo("[INFO] Video detected. Running one-time FFmpeg extraction...")
+            # Falls no-cache, extrahieren wir direkt kleine Bilder auf Disk
+            # Falls RAM-Cache, extrahieren wir normal und resizen dann in den RAM
+            click.echo(f"[INFO] Video detected. Preparing 64x64 thumbnails ({'Disk' if no_cache else 'RAM'})...")
             in_path = repo_tmp_dir / f"vid_{label}"
             in_path.write_bytes(content_bytes)
-            out_pattern = str(repo_tmp_dir / f"frame_{label}_%05d.jpg")
             
             bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
             ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
-            subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "2", out_pattern],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if no_cache:
+                # Extrahiere direkt 64x64 Graustufen JPEGs auf Disk um RAM zu sparen
+                out_pattern = str(repo_tmp_dir / f"small_{label}_%05d.jpg")
+                subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vf", "scale=64:64,format=gray", "-q:v", "4", out_pattern],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            else:
+                # Extrahiere einmalig zum Einlesen in den RAM
+                out_pattern = str(repo_tmp_dir / f"temp_ext_{label}_%05d.jpg")
+                subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), "-vsync", "0", "-q:v", "4", out_pattern],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                
+                # In den RAM laden und Originale löschen
+                temp_files = sorted(repo_tmp_dir.glob(f"temp_ext_{label}_*.jpg"))
+                for p in temp_files:
+                    with Image.open(p) as tmp_img:
+                        ram_cache.append(tmp_img.resize((64, 64)).convert("L"))
+                    p.unlink()
+            
             if in_path.exists(): in_path.unlink()
-            click.echo("[INFO] Extraction complete.")
-
-        # Generator-Factory Setup
-        if is_pil:
-            frame_gen_factory = lambda: pil_frame_gen(content_bytes)
+            click.echo("[INFO] Preparation complete.")
         else:
-            frame_gen_factory = lambda: ffmpeg_frame_gen_cached(label, repo_tmp_dir)
+            # PIL Animation (GIF etc)
+            with Image.open(BytesIO(content_bytes)) as container:
+                for i in range(getattr(container, "n_frames", 1)):
+                    container.seek(i)
+                    small = container.convert("L").resize((64, 64))
+                    ram_cache.append(small)
 
         similarity_list = [float(s.strip()) for s in similarity.split(",") if s.strip()]
 
         # --- Calibration Loop ---
         for thr in similarity_list:
             click.echo(f"\n[TESTING] Similarity Threshold: {thr}")
-            current_frame_gen = frame_gen_factory()
             
+            # Generator für die 64x64 Bilder (entweder aus RAM oder von Disk)
+            if no_cache and not is_pil:
+                source_files = sorted(repo_tmp_dir.glob(f"small_{label}_*.jpg"))
+                frame_gen = (Image.open(p) for p in source_files)
+                total_len = len(source_files)
+            else:
+                frame_gen = iter(ram_cache)
+                total_len = len(ram_cache)
+
             current_total = 0
             current_kept = 0
-            selected_frames = []
             last_small = None
 
             def progress_label(item):
-                return f"Frame:{current_total}/{total_video_frames} Kept:{current_kept}"
+                return f"Frame:{current_total}/{total_len} Kept:{current_kept}"
 
             with click.progressbar(
-                current_frame_gen,
-                length=total_video_frames,
+                frame_gen,
+                length=total_len,
                 label=f"Calibration (Thr {thr})",
                 item_show_func=progress_label
             ) as bar:
-                for img in bar:
+                for small_img in bar:
                     current_total += 1
                     bar.update(0)
 
-                    small = img.resize((64, 64)).convert("L")
                     keep = False
                     if last_small is None:
                         keep = True
                     else:
-                        diff = ImageChops.difference(small, last_small)
+                        diff = ImageChops.difference(small_img, last_small)
                         stat = ImageStat.Stat(diff)
                         mean_diff = sum(stat.mean) / len(stat.mean)
                         if mean_diff >= thr:
@@ -1021,21 +1035,18 @@ def video_similarity_calibration(
 
                     if keep:
                         current_kept += 1
-                        last_small = small
-                        selected_frames.append(img)
-                        if max_frames > 0 and len(selected_frames) >= max_frames:
+                        last_small = small_img.copy() if no_cache else small_img
+                        if max_frames > 0 and current_kept >= max_frames:
                             break
-                    else:
-                        img.close()
+                    
+                    if no_cache: small_img.close()
 
             with open(summary_file, "a", encoding="utf-8") as sf:
-                sf.write(f"Threshold {thr}: selected {len(selected_frames)} frames (from {current_total})\n")
+                sf.write(f"Threshold {thr}: selected {current_kept} frames (from {current_total})\n")
 
-            click.echo(f"[RESULT] Threshold {thr}: {len(selected_frames)} frames selected.")
-            for f in selected_frames: f.close()
+            click.echo(f"[RESULT] Threshold {thr}: {current_kept} frames selected.")
             processed_count += 1
-
-            if len(selected_frames) <= 1:
+            if current_kept <= 1:
                 click.echo("[INFO] Stop: Threshold too high.")
                 break
 
@@ -1045,22 +1056,14 @@ def video_similarity_calibration(
         logging.warning("=== INTERRUPTED BY USER (CTRL+C) ===")
 
     finally:
-        # --- Cleanup Frames ---
-        if not is_pil:
-            click.echo("[INFO] Cleaning up temporary frames...")
-            for p in repo_tmp_dir.glob(f"frame_{label}_*.jpg"):
-                try:
-                    p.unlink()
+        # Cleanup der 64x64 Disk-Frames falls no-cache genutzt wurde
+        if no_cache:
+            click.echo("[INFO] Cleaning up 64x64 cache frames...")
+            for p in repo_tmp_dir.glob(f"small_{label}_*.jpg"):
+                try: p.unlink()
                 except Exception: pass
 
         logging.info("=== WD HYDRUS VIDEO CALIBRATION FINISHED ===")
-        logging.info(f"Total thresholds tested: {processed_count}")
-
-        if interrupted:
-            logging.info("Run ended due to manual interruption.")
-        else:
-            logging.info("Run completed normally.")
-
         logging.shutdown()
         click.echo(f"\nFinished. Thresholds processed: {processed_count}")
 
@@ -1068,750 +1071,8 @@ def video_similarity_calibration(
             try:
                 click.echo("Debug mode: press Enter to exit.")
                 input()
-            except Exception:
-                pass
+            except Exception: pass
 
-# =====================================================================================================================
-
-def _Legacy_select_frames_from_images(images: list[PILImage], similarity_threshold: float = 12.0, max_frames: int = 0) -> list[PILImage]:
-    """Select a subset of frames from a sequence by simple similarity filtering.
-
-    The function performs a lightweight pairwise comparison using resized
-    grayscale frame differences and only keeps a frame if it is sufficiently
-    different from the last-kept frame. This reduces redundant frames and
-    controls processing cost.
-
-    :param images: Sequence of PIL images (RGB) to filter.
-    :param similarity_threshold: Mean-difference threshold to decide if two
-        frames are different enough to keep.
-    :param max_frames: Maximum number of frames to keep. Use 0 for no limit.
-    :returns: A list of selected PIL images.
-    """
-    selected: list[PILImage] = []
-    last_small = None
-    for img in images:
-        small = img.copy().resize((64, 64)).convert("L")
-        if last_small is None:
-            selected.append(img)
-            last_small = small
-        else:
-            diff = ImageChops.difference(small, last_small)
-            stat = ImageStat.Stat(diff)
-            mean_diff = sum(stat.mean) / len(stat.mean)
-            if mean_diff >= similarity_threshold:
-                selected.append(img)
-                last_small = small
-        # If max_frames is > 0 enforce the limit; if 0 treat as unlimited
-        if max_frames > 0 and len(selected) >= max_frames:
-            break
-    return selected
-
-
-@click.command()
-@click.option("--hashfile", help="Text file containing Hydrus hashes")
-@click.option("--search-tag", multiple=True,
-              help="Hydrus tag(s) to search for (can be used multiple times)")
-@click.option("--token", required=True, help="Hydrus API token")
-@click.option("--cpu", default=True, help="False to Use GPU instead of CPU")
-@click.option("--model", default="wd-eva02-large-tagger-v3",
-              help="Tagging model to use")
-@click.option("--threshold", default=0.35,
-              help="Threshold to drop tags below")
-@click.option("--host", default="http://127.0.0.1:45869",
-              help="The URL for your Hydrus server ")
-@click.option("--tag-service", default="ai tags",
-              help="The Hydrus tag service to add tags to")
-@click.option("--ratings-only", default=False,
-              help="Strip all tags except content rating")
-@click.option("--privacy", default=True,
-              help="Hide tag output from cli")
-@click.option("--debug", is_flag=True, default=False,
-              help="Show debug progress for video processing")
-@profile(stream=memory_profiler_logg)
-def legacy_evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...], token: str, cpu: bool,
-                             model: str, threshold: float, host: str,
-                             tag_service: str, ratings_only: bool, privacy: bool, debug: bool) -> None:
-    """Evaluate a batch of multi-frame content (GIF/video) and apply tags.
-
-    This command is similar to :func:`evaluate_api_batch` but targets
-    multi-frame content. For animated GIFs the frames are read via PIL; for
-    other video containers the function will attempt to use ``ffmpeg`` (if
-    available) to extract one frame per second. Frames are dynamically
-    filtered for similarity before interrogation for efficiency.
-
-    The per-frame tag scores are aggregated (averaged) and the resulting tag
-    list is applied to the original video file in Hydrus.
-
-    :param hashfile: Optional path to a newline-separated file containing
-        Hydrus file hashes to process.
-    :param search_tag: One or more Hydrus tags to search for; mutually
-        exclusive with ``hashfile``.
-    :param token: Hydrus API token for authentication.
-    :param cpu: When True, run the interrogator in CPU mode; False to prefer GPU.
-    :param model: Local model folder name to load (under ``./model``).
-    :param threshold: Minimum tag score threshold to include a tag.
-    :param host: URL of the target Hydrus server.
-    :param tag_service: Name of the Hydrus tag service to which tags are added.
-    :param ratings_only: If True, only the content rating tag is added.
-    :param privacy: If True, suppress tag output to the CLI.
-    """
-
-    # Setup logging and model like the image batch command
-    os.makedirs("logs", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    logfile = f"logs/{model}_{timestamp}.log"
-
-    logging.basicConfig(
-        filename=logfile,
-        level=logging.INFO,
-        format="%(asctime)s - %(message)s"
-    )
-
-    logging.info("=== WD HYDRUS VIDEO TAGGER START ===")
-    logging.info(f"Model: {model}")
-    logging.info(f"CPU Mode: {cpu}")
-    logging.info(f"Tag Service: {tag_service}")
-    # Clean up repository-local ffmpeg temporary files from previous runs
-    try:
-        repo_root = Path(__file__).resolve().parents[1]
-        repo_tmp_dir = repo_root / "ffmpeg_temp"
-        if repo_tmp_dir.exists():
-            for p in repo_tmp_dir.iterdir():
-                try:
-                    # Delete only folders starting with "deleted_"
-                    if p.is_dir() and p.name.startswith("deleted_"):
-                        shutil.rmtree(p)
-                     # Delete only files matching "frame_*.jpg"
-                    elif p.is_file() and p.name.startswith("frame_") and p.suffix == ".jpg":
-                        p.unlink()
-                except Exception:
-                    # ignore individual cleanup errors
-                    pass
-    except Exception:
-        logging.exception("Failed to clean ffmpeg_temp at startup")
-
-    if not os.path.isfile('./model/' + model + '/info.json'):
-        raise ValueError("info.json not found in model folder!")
-
-    with open('./model/' + model + '/info.json') as json_f:
-        modelinfo: dict[str, Any] = json.load(json_f)
-        done_hashes_file: str = f"done-hashes-{modelinfo['modelname']}.txt"
-
-    if ratings_only and not modelinfo['ratingsflag']:
-        raise ValueError("--ratings-only set, but model does not support ratings!")
-
-    interrogator: interrogate.WaifuDiffusionInterrogator = interrogate.WaifuDiffusionInterrogator(
-        modelinfo['modelname'],
-        modelinfo['modelfile'],
-        modelinfo['tagsfile'],
-        model,
-        modelinfo['ratingsflag'],
-        modelinfo['numberofratings'],
-        repo_id=modelinfo['source'],
-    )
-    interrogator.load(cpu)
-
-    client: hydrus_api.Client = hydrus_api.Client(token, host)
-
-    # Determine file source (search for video content)
-    using_tag_search: bool = False
-
-    if search_tag:
-        using_tag_search = True
-        logging.info(f"Search Tags: {search_tag}")
-        # Include only animated/video types
-        query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video", "system:number of frames < 2,500", "system:filesize < 200MB"]
-        # system:number of frames < 2,500
-        # system:filesize < 200MB
-        # lose safeguards against long/big videos that would cause memory issues in the frame selection code.
-        # this is a bit of a hack as ther seems to be a memory leak 
-        # or just bad code in my _Legacy_select_frames_from_images function that causes it to consume more and more memory the more frames it processes.
-        # this is a crude way to skip those while still allowing many other videos to be processed. 
-        # Ideally I would fix the underlying issue in the frame selection code, 
-        # but in the meantime this is a practical workaround to avoid crashing or freezing.
-
-        client.search_files(tags=query_tags)
-        hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=16))
-        # sort type 16 is "system:number of frames", which should help with processing efficiency by front-loading shorter videos that are less likely to hit memory issues
-
-        click.echo(f"Found {len(hashes)} files (animated/video).")
-        logging.info(f"Found {len(hashes)} files via tag search")
-
-    elif hashfile:
-        if not os.path.isfile(hashfile):
-            raise ValueError("hashfile not found!")
-
-        with open(hashfile) as f:
-            hashes: list[str] = [line.strip() for line in f if line.strip()]
-
-        logging.info(f"Loaded {len(hashes)} hashes from file")
-
-    else:
-        raise ValueError("Provide either --search-tag or --hashfile")
-
-    done_hashes: set[str] = set()
-    bad_hashes: set[str] = set()
-
-    if not using_tag_search:
-        if os.path.exists(done_hashes_file):
-            with open(done_hashes_file, "r", encoding="utf-8") as f:
-                done_hashes = {line.strip() for line in f if line.strip()}
-
-    if os.path.exists("bad-hashes.txt"):
-        with open("bad-hashes.txt", "r", encoding="utf-8") as f:
-            bad_hashes = {line.strip() for line in f if line.strip()}
-
-    processed_count = 0
-    interrupted = False
-
-    # gpt speacial: 
-    # I added a custom progress bar item_show_func to display the current index and total count of hashes being processed,
-    # since video processing can take significantly longer than single images and it's helpful to have a sense of progress through the batch. 
-    # The counterh generator is used to keep track of the current index in a way that works with the progress bar's iteration. 
-    # This should provide more informative progress feedback during long video batch runs.
-    counterh = count(1)
-    totalh = len(hashes)
-    @profile(stream=memory_profiler_logg)
-    def _show_idh(_):
-        return f"{next(counterh)}/{totalh}"
-
-    try:
-        with click.progressbar(hashes, length=totalh, item_show_func=_show_idh) as bar:
-            for file_hash in bar:
-                file_hash = str(file_hash)
-
-                if not file_hash or file_hash in bad_hashes:
-                    continue
-
-                if not using_tag_search and file_hash in done_hashes:
-                    continue
-
-                click.echo(" processing: " + file_hash)
-                logging.info(f"Processing: {file_hash}")
-
-                try:
-                    response: Any = get_file_with_retry(client, file_hash)
-
-                except hydrus_api.APIError as e:
-                    info = e.response.json()
-                    status = info.get("status_code")
-                    etype = info.get("exception_type")
-                    click.echo(f"Hydrus error {status} ({etype}) on {file_hash}")
-                    logging.warning(f"Hydrus error {status} ({etype}) on {file_hash}")
-
-                    if etype == "FileMissingException":
-                        click.echo(f"Added to bad-hashes.txt: {file_hash}")
-                        bad_hashes.add(file_hash)
-                        with open("bad-hashes.txt", "a", encoding="utf-8") as bad_f:
-                            bad_f.write(file_hash + "\n")
-                        continue
-                    else:
-                        raise
-                except RuntimeError as e:
-                    click.echo(str(e))
-                    click.echo("Hydrus seems unreachable — stopping batch.")
-                    logging.error(str(e))
-                    logging.error("Hydrus seems unreachable — stopping batch.")
-                    raise
-
-                images: list[PILImage] = []
-
-                # Try to open as an animated image first (GIF, APNG via PIL)
-                try:
-                    image_bytes = BytesIO(response.content)
-                    img = Image.open(image_bytes)
-                    if getattr(img, "is_animated", False) or getattr(img, "n_frames", 1) > 1:
-                        for i in range(getattr(img, "n_frames", 1)):
-                            img.seek(i)
-                            frame = img.convert("RGB").copy()
-                            images.append(frame)
-                        click.echo(f"  found {len(images)} frames via PIL animation")
-                        logging.info(f"Found {len(images)} frames via PIL animation")
-                    else:
-                        img.close()
-                except Exception:
-                    images = []
-
-                # If not an animated image, attempt ffmpeg frame extraction
-                tmpdir = None
-                if not images:
-                    # prefer using a repo-local temporary directory instead of
-                    # the system/AppData temp folder so extracted frames stay
-                    # inside the repository
-                    repo_root = Path(__file__).resolve().parents[1]
-                    repo_tmp_dir = repo_root / "ffmpeg_temp"
-                    repo_tmp_dir.mkdir(parents=True, exist_ok=True)
-                    in_path = repo_tmp_dir / f"input_{file_hash}"
-                    with open(in_path, "wb") as f:
-                        f.write(response.content)
-
-                    out_pattern = str(repo_tmp_dir / f"frame_{file_hash}_%05d.jpg")
-                    # Prefer bundled ffmpeg in the repository under ./ffmpeg/bin,
-                    # otherwise fall back to system `ffmpeg` on PATH.
-                    repo_root = Path(__file__).resolve().parents[1]
-                    bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-                    if bundled_ffmpeg.exists():
-                        ffmpeg_cmd = str(bundled_ffmpeg)
-                        #logging.info(f"Using bundled ffmpeg: {ffmpeg_cmd}")
-                    else:
-                        ffmpeg_cmd = "ffmpeg"
-                        #logging.info("Using system ffmpeg (no bundled ffmpeg found)")
-
-                    # extract all frames; ffmpeg may be absent — ignore errors
-                    # use -vsync 0 to avoid duplicate/drop frames, output as images
-                    cmd = [ffmpeg_cmd, "-y", "-i", str(in_path), "-fps_mode", "passthrough", "-q:v", "2", out_pattern]
-                    try:
-                        if debug:
-                            click.echo("  extracting frames with ffmpeg...")
-                            subprocess.run(cmd, check=False)
-                        else:
-                            click.echo("  extracting frames with ffmpeg...")
-                            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                        frames = sorted(repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"))
-                        for p in frames:
-                            try:
-                                fimg = Image.open(p).convert("RGB")
-                                images.append(fimg)
-                            except Exception:
-                                continue
-                        click.echo(f"  extracted {len(frames)} frames via ffmpeg")
-                        logging.info(f"Extracted {len(frames)} frames via ffmpeg")
-                    except FileNotFoundError:
-                        # ffmpeg not found; treat as unreadable video
-                        images = []
-
-                if not images:
-                    click.echo(f"Skipping unreadable or unsupported multi-frame file: {file_hash}")
-                    logging.warning(f"Skipping unreadable or unsupported multi-frame file: {file_hash}")
-                    bad_hashes.add(file_hash)
-                    with open("bad-hashes.txt", "a", encoding="utf-8") as bad_f:
-                        bad_f.write(file_hash + "\n")
-                    # remove any ffmpeg files produced for this hash, including
-                    # any previously-moved unused frames in deleted_{hash}
-                    try:
-                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportOptionalMemberAccess, reportPossiblyUnboundVariable]
-                            try:
-                                p.unlink()
-                            except Exception:
-                                pass
-                        in_file = repo_tmp_dir / f"input_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-                        if in_file.exists():
-                            try:
-                                in_file.unlink()
-                            except Exception:
-                                pass
-                        deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportOperatorIssue, reportPossiblyUnboundVariable]
-                        if deleted_dir.exists():
-                            try:
-                                shutil.rmtree(deleted_dir)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    continue
-
-                selected = _Legacy_select_frames_from_images(images)
-                click.echo(f"  selected {len(selected)} frames after similarity filtering")
-                logging.info(f"Selected {len(selected)} frames after similarity filtering")
-
-                # If frames were extracted to the repository temp dir, remove
-                # any on-disk frame images that were not selected so the temp
-                # folder doesn't accumulate unused files.
-                try:
-                    repo_tmp_dir  # pyright: ignore[reportPossiblyUnboundVariable, reportUnusedExpression] # check if the variable exists in this scope
-                except NameError:
-                    repo_tmp_dir = None
-
-                if repo_tmp_dir is not None and repo_tmp_dir.exists(): # type: ignore
-                    frames_on_disk = sorted(repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg")) # pyright: ignore[reportPossiblyUnboundVariable]
-                    if frames_on_disk:
-                        if debug:
-                            # In debug mode, move unused extracted frames to a
-                            # per-hash "deleted" subfolder so the user can inspect
-                            # them separately.
-                            deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-                            try:
-                                deleted_dir.mkdir(parents=True, exist_ok=True)
-                            except Exception:
-                                deleted_dir = None
-
-                            # Determine which indices were kept by identity comparison
-                            used_indices = {i for i, img in enumerate(images) if img in selected}
-                            for idx, p in enumerate(frames_on_disk):
-                                if idx not in used_indices:
-                                    if deleted_dir is not None:
-                                        try:
-                                            p.rename(deleted_dir / p.name)
-                                        except Exception:
-                                            try:
-                                                p.unlink()
-                                            except Exception:
-                                                pass
-                                    else:
-                                        try:
-                                            p.unlink()
-                                        except Exception:
-                                            pass
-                        else:
-                            # Not in debug mode: keep all extracted frames in the
-                            # temp folder until the per-hash final cleanup runs.
-                            pass
-
-                # If debug flag set, pause after similarity filtering so user can
-                # inspect selected frames before tagging continues.
-                if debug:
-                    try:
-                        click.echo("Debug: press Enter to continue after similarity filtering.")
-                        input()
-                    except Exception:
-                        pass
-
-                # Aggregate tags over selected frames
-                agg_scores: dict[str, float] = {}
-                agg_ratings: dict[str, float] = {}
-                frames_processed = 0
-                total_frames = len(selected)
-                click.echo(f"  starting tagging of {total_frames} frames")
-                logging.info(f"Starting tagging of {total_frames} frames")
-
-                @profile(stream=memory_profiler_logg)
-                def _show_idx(item) -> str:
-                    # item is a (idx, frame) tuple when using enumerate
-                    try:
-                        idx = item[0]
-                        return f"{idx+1}/{total_frames}"
-                    except Exception:
-                        return ""
-
-                enumerated = list(enumerate(selected))
-                with click.progressbar(enumerated, label="Tagging frames", length=total_frames, item_show_func=_show_idx) as pbar:
-                    for idx, frame in pbar:
-                        ratings, tags = interrogator.interrogate(frame)
-                        for t, s in tags.items():
-                            agg_scores[t] = agg_scores.get(t, 0.0) + float(s)
-                        for r, s in ratings.items():
-                            agg_ratings[r] = agg_ratings.get(r, 0.0) + float(s)
-                        frames_processed += 1
-
-                if frames_processed == 0:
-                    click.echo(f"No usable frames for {file_hash}")
-                    logging.warning(f"No usable frames for {file_hash}")
-                    # remove any ffmpeg files produced for this hash, including
-                    # any previously-moved unused frames in deleted_{hash}
-                    try:
-                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportOptionalMemberAccess, reportPossiblyUnboundVariable]
-                            try:
-                                p.unlink()
-                            except Exception:
-                                pass
-                        in_file = repo_tmp_dir / f"input_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-                        if in_file.exists():
-                            try:
-                                in_file.unlink()
-                            except Exception:
-                                pass
-                        deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-                        if deleted_dir.exists():
-                            try:
-                                shutil.rmtree(deleted_dir)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    continue
-
-                # Ensure all selected frames were actually processed before sending tags
-                if frames_processed != total_frames:
-                    click.echo(f"Incomplete frame processing ({frames_processed}/{total_frames}) for {file_hash} — skipping tag write")
-                    logging.warning(f"Incomplete frame processing ({frames_processed}/{total_frames}) for {file_hash} — skipping tag write")
-                    # cleanup ffmpeg files for this hash, including any moved
-                    # unused frames stored in deleted_{hash}
-                    try:
-                        for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportOptionalMemberAccess, reportPossiblyUnboundVariable]
-                            try:
-                                p.unlink()
-                            except Exception:
-                                pass
-                        in_file = repo_tmp_dir / f"input_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-                        if in_file.exists():
-                            try:
-                                in_file.unlink()
-                            except Exception:
-                                pass
-                        deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-                        if deleted_dir.exists():
-                            try:
-                                shutil.rmtree(deleted_dir)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    continue
-
-                click.echo(f"  processed {frames_processed} frames for {file_hash}")
-                logging.info(f"Processed {frames_processed} frames for {file_hash}")
-
-                # average scores across frames
-                for k in list(agg_scores.keys()):
-                    agg_scores[k] /= frames_processed
-                for k in list(agg_ratings.keys()):
-                    agg_ratings[k] /= frames_processed
-
-                # Pick rating as the highest-averaged rating key
-                rating = "none"
-                if modelinfo['ratingsflag']:
-                    agg_ratings.setdefault("none", 0.0)
-                    for key in agg_ratings.keys():
-                        if agg_ratings[key] > agg_ratings[rating]:
-                            rating = key
-
-                clipped_tags: list[str] = []
-                if not ratings_only:
-                    for key, score in agg_scores.items():
-                        if score > threshold:
-                            clipped_tags.append(key.replace("_", " ") if key not in kaomojis else key)
-
-                if not privacy:
-                    click.echo("rating: " + rating)
-                    click.echo("tags: " + ", ".join(clipped_tags))
-                    click.echo()
-
-                if modelinfo['ratingsflag']:
-                    clipped_tags.append("rating:" + rating)
-
-                if ratings_only:
-                    clipped_tags.append("ratings only " + modelinfo['modelname'] + " ai generated tags")
-                else:
-                    clipped_tags.append(modelinfo['modelname'] + " ai generated tags")
-
-                client.add_tags(
-                    hashes=[file_hash],
-                    service_names_to_tags={tag_service: clipped_tags} # pyright: ignore[reportCallIssue]
-                )
-
-                processed_count += 1
-
-                if not using_tag_search:
-                    done_hashes.add(file_hash)
-                    with open(done_hashes_file, "a", encoding="utf-8") as done_f:
-                        done_f.write(file_hash + "\n")
-
-                time.sleep(0.1)
-
-                # cleanup ffmpeg files created for this hash, including any moved
-                # unused frames stored in deleted_{hash}
-                try:
-                    for p in repo_tmp_dir.glob(f"frame_{file_hash}_*.jpg"): # pyright: ignore[reportOptionalMemberAccess, reportPossiblyUnboundVariable]
-                        try:
-                            p.unlink()
-                        except Exception:
-                            pass
-                    in_file = repo_tmp_dir / f"input_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-                    if in_file.exists():
-                        try:
-                            in_file.unlink()
-                        except Exception:
-                            pass
-                    deleted_dir = repo_tmp_dir / f"deleted_{file_hash}" # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-                    if deleted_dir.exists():
-                        try:
-                            shutil.rmtree(deleted_dir)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                if processed_count % 200 == 0:
-                    time.sleep(3)
-                    logging.info(f"Processed {processed_count} files")
-
-    except KeyboardInterrupt:
-        interrupted = True
-        click.echo("\n[!] Interrupted by user (Ctrl+C)")
-        logging.warning("=== INTERRUPTED BY USER (CTRL+C) ===")
-
-    finally:
-        logging.info("=== WD HYDRUS VIDEO TAGGER FINISHED ===")
-        logging.info(f"Total processed: {processed_count}")
-
-        if interrupted:
-            logging.info("Run ended due to manual interruption.")
-        else:
-            logging.info("Run completed normally.")
-
-        logging.shutdown()
-
-        click.echo(f"\nFinished. Total processed: {processed_count}")
-
-        if debug:
-            try:
-                click.echo("Debug mode: press Enter to exit.")
-                input()
-            except Exception:
-                # If stdin is not available, ignore and continue exiting
-                pass
-
-
-@click.command(name="legacy_video_similarity_calibration")
-@click.option("--file-hash", help="Hydrus file hash to fetch (mutually exclusive with --local-file)")
-@click.option("--local-file", help="Path to a local video file (mutually exclusive with --file-hash)")
-@click.option("--token", help="Hydrus API token (required if --file-hash used)")
-@click.option("--host", default="http://127.0.0.1:45869", help="Hydrus host (used with --file-hash)")
-@click.option("--similarity", default="10.0,9.0,8.0,7.0,6.0,5.0,4.0,3.0,2.0,1.0", help="Comma-separated similarity thresholds to test, e.g. '10.0,9.0,8.0'")
-@click.option("--max-frames", default=0, type=int, help="Maximum frames to keep per threshold (0 = unlimited)")
-@click.option("--debug", is_flag=True, default=False, help="Show debug output and keep extracted frames")
-@profile(stream=memory_profiler_logg)
-def legacy_video_similarity_calibration(file_hash: Optional[str], local_file: Optional[str], token: Optional[str], host: str, similarity: str, max_frames: int, debug: bool) -> None:
-    """Calibration helper: extract frames and test similarity thresholds.
-
-    Fetches a single video either from Hydrus (by hash) or from a local file,
-    extracts frames (PIL or ffmpeg), runs `_Legacy_select_frames_from_images` for
-    each supplied `--similarity` value and writes the results to the CLI and a summary text file in the repository. 
-    This allows users to calibrate the similarity threshold for frame selection by seeing how many frames are kept at different thresholds for a given video. 
-    The summary text file is written to the repository's `ffmpeg_temp` folder with a name like `summary_{hash}.txt` or `summary_{localfilename}.txt`.
-
-    IMPORTANT: This command never sends tags back to Hydrus.
-    """
-    if not file_hash and not local_file:
-        raise ValueError("Provide either --file-hash or --local-file")
-    if file_hash and not token:
-        raise ValueError("--token is required when using --file-hash")
-
-    # Obtain bytes for the input file
-    content_bytes: bytes
-    label = None
-    if file_hash:
-        client = hydrus_api.Client(token, host)
-        try:
-            response = get_file_with_retry(client, file_hash)
-        except Exception as e:
-            click.echo(f"Failed to fetch file from Hydrus: {e}")
-            return
-        content_bytes = response.content
-        label = file_hash
-    else:
-        p = Path(local_file) # pyright: ignore[reportArgumentType]
-        if not p.exists():
-            raise ValueError("Local file not found")
-        with open(p, "rb") as f:
-            content_bytes = f.read()
-        label = p.stem
-
-
-    # Setup logging and model like the image batch command
-    os.makedirs("logs", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    logfile = f"logs/vsc_{timestamp}_{label}.log"
-
-    logging.basicConfig(
-        filename=logfile,
-        level=logging.INFO,
-        format="%(asctime)s - %(message)s"
-    )
-
-
-
-    images: list[PILImage] = []
-    extracted_frames_count: Optional[int] = None
-
-    # Parse similarity thresholds: accept comma-separated string like "10.0,9.0,8.0"
-    try:
-        if isinstance(similarity, str):
-            similarity_list: list[float] = [float(s.strip()) for s in similarity.split(",") if s.strip()]
-        else:
-            similarity_list = list(similarity)
-    except Exception:
-        click.echo("Invalid --similarity format; expected comma-separated floats")
-        return
-
-    # Try PIL animated image first
-    try:
-        img = Image.open(BytesIO(content_bytes))
-        if getattr(img, "is_animated", False) or getattr(img, "n_frames", 1) > 1:
-            for i in range(getattr(img, "n_frames", 1)):
-                img.seek(i)
-                frame = img.convert("RGB").copy()
-                images.append(frame)
-            click.echo(f"Found {len(images)} frames via PIL animation")
-        else:
-            img.close()
-    except Exception:
-        images = []
-
-    # If not animated via PIL, try ffmpeg extraction into repo-local tmp
-    repo_root = Path(__file__).resolve().parents[1]
-    repo_tmp_dir = repo_root / "ffmpeg_temp"
-    repo_tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    if not images:
-        in_path = repo_tmp_dir / f"input_{label}"
-        with open(in_path, "wb") as f:
-            f.write(content_bytes)
-
-        out_pattern = str(repo_tmp_dir / f"frame_{label}_%05d.jpg")
-        bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == 'nt' else "ffmpeg")
-        if bundled_ffmpeg.exists():
-            ffmpeg_cmd = str(bundled_ffmpeg)
-            logging.info(f"Using bundled ffmpeg: {ffmpeg_cmd}")
-        else:
-            ffmpeg_cmd = "ffmpeg"
-            logging.info("Using system ffmpeg (no bundled ffmpeg found)")
-
-        cmd = [ffmpeg_cmd, "-y", "-i", str(in_path), "-fps_mode", "passthrough", "-q:v", "2", out_pattern]
-        try:
-            if debug:
-                click.echo("  extracting frames with ffmpeg...")
-                subprocess.run(cmd, check=False)
-            else:
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            frames = sorted(repo_tmp_dir.glob(f"frame_{label}_*.jpg"))
-            for p in frames:
-                try:
-                    fimg = Image.open(p).convert("RGB")
-                    images.append(fimg)
-                except Exception:
-                    continue
-            extracted_frames_count = len(frames)
-            click.echo(f"  extracted {extracted_frames_count} frames via ffmpeg")
-        except FileNotFoundError:
-            click.echo("ffmpeg not found; unable to extract frames via ffmpeg")
-
-    if not images:
-        click.echo("No frames were extracted or detected; aborting calibration.")
-        return
-
-    # If frames were extracted via ffmpeg record that at the top of the summary
-    try:
-        if extracted_frames_count is not None:
-            summary_file = repo_tmp_dir / f"summary_{label}.txt"
-            # write extraction line first so it appears at top
-            logging.info(f"  extracted {extracted_frames_count} frames via ffmpeg")
-            with open(summary_file, "a", encoding="utf-8") as sf:
-                sf.write(f"  extracted {extracted_frames_count} frames via ffmpeg\n")
-    except Exception:
-        pass
-
-    # Run selection for each supplied similarity threshold and save results
-    for thr in similarity_list:
-        selected = _Legacy_select_frames_from_images(images, similarity_threshold=float(thr), max_frames=max_frames)
-        click.echo(f"Threshold {thr}: selected {len(selected)} frames")
-        # also append the summary line to a summary text file in the calibration folder
-        logging.info(f"Threshold {thr}: selected {len(selected)} frames")
-        try:
-            summary_file = repo_tmp_dir / f"summary_{label}.txt"
-            with open(summary_file, "a", encoding="utf-8") as sf:
-                sf.write(f"Threshold {thr}: selected {len(selected)} frames\n")
-        except Exception:
-            pass
-        #stop if only one frame is selected
-        if len(selected) == 1:
-            break
-
-
-    click.echo(f"Calibration artifacts written to: {repo_tmp_dir}")
-    click.echo("IMPORTANT: No tags were written to Hydrus by this command.")
-
-# =============================================================================================================================================
 
 
 
@@ -1820,11 +1081,7 @@ if __name__ == '__main__':
     Image.init()
     ImageFile.LOAD_TRUNCATED_IMAGES = True
     cli.add_command(evaluate_api_batch) # pyright: ignore[reportFunctionMemberAccess]
-
     cli.add_command(evaluate_api_batch_video) # pyright: ignore[reportFunctionMemberAccess]
     cli.add_command(video_similarity_calibration) # pyright: ignore[reportFunctionMemberAccess]
-
-    cli.add_command(legacy_video_similarity_calibration) # pyright: ignore[reportFunctionMemberAccess]
-    cli.add_command(legacy_evaluate_api_batch_video) # pyright: ignore[reportFunctionMemberAccess]
     cli()
 
