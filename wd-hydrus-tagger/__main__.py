@@ -671,7 +671,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 total_video_duration = metadata[0].get('duration') or 0
 
                 width = metadata[0].get('width') or 0
-                height = metadata[0].get('duratheightion') or 0
+                height = metadata[0].get('height') or 0
 
                 # Now it is safe to log and process
                 #logging.info(f"Metadata received: {metadata}")
@@ -679,7 +679,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 def dynamic_threshold(total_video_frames: float, total_video_duration: float, width: int, height: int) -> float:
                     # 1. Safety check for None/Zero values (prevents the crash you had)
                     if not total_video_duration or not total_video_frames:
-                        return 4.0 
+                        return 6.0 
 
                     # 2. Basic Time/FPS calculations
                     duration_seconds = total_video_duration / 1000.0
@@ -692,7 +692,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     scale_ratio = 448 / original_max_dim
                     
                     # 4. Threshold Logic
-                    base = 0.75 * math.log(max(total_video_frames, 1)) - 3.0
+                    base = 0.5 * math.log(max(total_video_frames, 1)) - 1.0
                     fps_adjust = 0.15 * math.log(max(fps, 1))
                     
                     # 5. Resolution Adjustment
@@ -702,7 +702,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                     t = base + fps_adjust + res_adjust
                     
-                    # Returning the final value clamped between 2.0 and 50.0 as requested
+                    # Returning the final value clamped between 2.0 and 25.0
                     return max(2.0, min(t, 25.0))
 
                 similarity_threshold_ff = 12.0
@@ -762,6 +762,11 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     count = 0
                     in_path = tmp_dir / f"vid_{h}"
                     in_path.write_bytes(data)
+
+                    del data
+                    gc.collect() # Erzwingt die sofortige Speicherfreigabe
+
+
                     out_pattern = str(tmp_dir / f"frame_{h}_%05d.jpg")
                     
                     repo_root = Path(__file__).resolve().parents[1]
@@ -1005,41 +1010,52 @@ def video_similarity_calibration(
 
         # 4. Vorbereitung (FFmpeg oder PIL Extraktion)
         if not is_pil:
-            click.echo(f"[INFO] Video detected. Extracting 448:448 thumbnails via FFmpeg...")
+            click.echo(f"[INFO] Video detected. Extracting thumbnails via FFmpeg...")
             in_path = repo_tmp_dir / f"vid_{label}"
             in_path.write_bytes(content_bytes)
             
+            # WICHTIG: Originale Bytes aus dem RAM löschen, sobald sie auf Disk geschrieben wurden
+            del content_bytes 
+            gc.collect() # Erzwingt die sofortige Speicherfreigabe
+
             bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
             ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
+            out_pattern = str(repo_tmp_dir / f"extract_{label}_%05d.jpg")
 
-            out_pattern = str(repo_tmp_dir / f"small_{label}_%05d.jpg")
-
-
+            # 1. Extrahiere Frames in Arbeitsgröße
             subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), 
                 "-vf", "scale=448:448:force_original_aspect_ratio=decrease,pad=448:448:(ow-iw)/2:(oh-ih)/2", 
                 "-fps_mode", "passthrough", 
                 "-q:v", "2", 
                 out_pattern
-            ],stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
-            if in_path.exists(): in_path.unlink()
+            # Video-Datei sofort löschen
+            if in_path.exists(): 
+                in_path.unlink()
+                click.echo("[INFO] Temporary video file removed from disk.")
 
-            if not no_cache:
-                click.echo("[INFO] Caching thumbnails to RAM...")
-                temp_files = sorted(repo_tmp_dir.glob(f"small_{label}_*.jpg"))
-                for p in temp_files:
-                    with Image.open(p) as tmp_img:
-                        ram_cache.append(tmp_img.copy())
-                    p.unlink()
+            # 2. Frames verarbeiten (Resize auf 64x64 & Graustufen)
+            extracted_files = sorted(repo_tmp_dir.glob(f"extract_{label}_*.jpg"))
             
-            click.echo("[INFO] Preparation complete.")
-        else:
-            with Image.open(BytesIO(content_bytes)) as container:
-                for i in range(getattr(container, "n_frames", 1)):
-                    container.seek(i)
-                    small = container.convert("L").resize((64, 64))
-                    ram_cache.append(small)
+            for p in extracted_files:
+                with Image.open(p) as tmp_img:
+                    # Konvertierung
+                    small_img = tmp_img.convert("L").resize((64, 64))
+                    
+                    if no_cache:
+                        # Speichere die winzige Version für späteren Festplatten-Zugriff
+                        target_path = repo_tmp_dir / f"small_{label}_{p.name.split('_')[-1]}"
+                        small_img.save(target_path, "JPEG", quality=90)
+                    else:
+                        # Behalte die winzige Version im RAM
+                        ram_cache.append(small_img)
+                
+                # Lösche das große 448x448 Frame sofort
+                p.unlink()
+
+            click.echo(f"[INFO] Preparation complete. {'Disk' if no_cache else 'RAM'} cache ready.")
 
         # 5. Calibration Loop
         similarity_list = [float(s.strip()) for s in similarity.split(",") if s.strip()]
