@@ -774,11 +774,12 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
                     subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), 
-                                    "-vf", "scale=448:448:force_original_aspect_ratio=decrease,pad=448:448:(ow-iw)/2:(oh-ih)/2", 
+                                    "-vf", "scale=448:448:flags=bicubic", 
+                                    "-pix_fmt", "rgb24",          # Entspricht .convert("RGB")
                                     "-fps_mode", "passthrough", 
-                                    "-q:v", "2", 
-                                    out_pattern],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                                    "-q:v", "2",
+                                    out_pattern
+                                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                     
                     for p in sorted(tmp_dir.glob(f"frame_{h}_*.jpg")):
                         with Image.open(p) as f_img:
@@ -1025,11 +1026,12 @@ def video_similarity_calibration(
 
             # 1. Extrahiere Frames in Arbeitsgröße
             subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), 
-                "-vf", "scale=448:448:force_original_aspect_ratio=decrease,pad=448:448:(ow-iw)/2:(oh-ih)/2", 
-                "-fps_mode", "passthrough", 
-                "-q:v", "2", 
-                out_pattern
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                            "-vf", "scale=448:448:flags=bicubic", 
+                            "-pix_fmt", "rgb24",          # Entspricht .convert("RGB")
+                            "-fps_mode", "passthrough", 
+                            "-q:v", "2",
+                            out_pattern
+                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
             # Video-Datei sofort löschen
             if in_path.exists(): 
