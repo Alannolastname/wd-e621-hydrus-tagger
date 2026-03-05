@@ -670,21 +670,43 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 num_frames = metadata[0].get('num_frames') or 0
                 total_video_duration = metadata[0].get('duration') or 0
 
+                width = metadata[0].get('width') or 0
+                height = metadata[0].get('duratheightion') or 0
+
                 # Now it is safe to log and process
                 #logging.info(f"Metadata received: {metadata}")
 
-                def dynamic_threshold(total_video_frames: float, total_video_duration: float) -> float:
+                def dynamic_threshold(total_video_frames: float, total_video_duration: float, width: int, height: int) -> float:
+                    # 1. Safety check for None/Zero values (prevents the crash you had)
+                    if not total_video_duration or not total_video_frames:
+                        return 4.0 
+
+                    # 2. Basic Time/FPS calculations
                     duration_seconds = total_video_duration / 1000.0
                     fps = total_video_frames / duration_seconds if duration_seconds > 0 else 30.0
 
-                    base = 0.75 * math.log(total_video_frames) - 4.0
+                    # 3. Resolution Scaling Factor
+                    # We find which side was the 'limiting' side for the 448 scale
+                    original_max_dim = max(width, height) if (width and height) else 448
+                    # If the original is 1920, scale_ratio is ~0.23. If original is 200, it's 2.24.
+                    scale_ratio = 448 / original_max_dim
+                    
+                    # 4. Threshold Logic
+                    base = 0.75 * math.log(max(total_video_frames, 1)) - 3.0
                     fps_adjust = 0.15 * math.log(max(fps, 1))
+                    
+                    # 5. Resolution Adjustment
+                    # Lower resolutions often need a slightly higher threshold because 
+                    # compression artifacts become more 'obvious' at small scales.
+                    res_adjust = 0.5 * math.log(1 / scale_ratio) if scale_ratio > 0 else 0
 
-                    t = base + fps_adjust
-                    return max(2.0, min(t, 50.0))
+                    t = base + fps_adjust + res_adjust
+                    
+                    # Returning the final value clamped between 2.0 and 50.0 as requested
+                    return max(2.0, min(t, 25.0))
 
                 similarity_threshold_ff = 12.0
-                similarity_threshold_ff = dynamic_threshold(num_frames, total_video_duration)
+                similarity_threshold_ff = dynamic_threshold(num_frames, total_video_duration, width, height)
 
                 if num_frames:
                     click.echo(f"\n  Processing {num_frames} frames for hash {file_hash}")
@@ -983,21 +1005,24 @@ def video_similarity_calibration(
 
         # 4. Vorbereitung (FFmpeg oder PIL Extraktion)
         if not is_pil:
-            click.echo(f"[INFO] Video detected. Extracting 64x64 thumbnails via FFmpeg...")
+            click.echo(f"[INFO] Video detected. Extracting 448:448 thumbnails via FFmpeg...")
             in_path = repo_tmp_dir / f"vid_{label}"
             in_path.write_bytes(content_bytes)
             
             bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
             ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
+
             out_pattern = str(repo_tmp_dir / f"small_{label}_%05d.jpg")
-            subprocess.run([
-                ffmpeg_exe, "-y", "-i", str(in_path), 
-                "-vf", "scale=64:64,format=gray", 
-                "-q:v", "4", 
+
+
+            subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), 
+                "-vf", "scale=448:448:force_original_aspect_ratio=decrease,pad=448:448:(ow-iw)/2:(oh-ih)/2", 
+                "-fps_mode", "passthrough", 
+                "-q:v", "2", 
                 out_pattern
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            
+            ],stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
             if in_path.exists(): in_path.unlink()
 
             if not no_cache:
