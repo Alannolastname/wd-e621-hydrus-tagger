@@ -19,12 +19,12 @@ most functions in this module use type hints and Sphinx-style docstrings.
 
 from __future__ import annotations
 
-from math import log
 import os
 import os.path
 import click # pyright: ignore[reportMissingImports]
 from PIL import Image, ImageFile, UnidentifiedImageError, ImageChops, ImageStat
 from PIL.Image import Image as PILImage
+from networkx import lexicographical_topological_sort
 from . import interrogate
 import hydrus_api
 from hydrus_api import APIError
@@ -37,32 +37,11 @@ from typing import Any, Optional, cast, Iterator
 import subprocess
 import shutil
 from pathlib import Path
-from itertools import count
 import gc
 import re
+import math
 
 
-
-# The memory_profiler import and setup is included here in the main module so that it can be used across all commands, 
-# including the video batch command which is where memory usage is more of a concern. 
-# The memory_profiler will log detailed memory usage information to a timestamped log file in the logs directory, 
-# which can be reviewed after running the commands to analyze memory behavior and identify potential issues.
-
-# @profile(stream=memory_profiler_logg) decorators are added to all functions even if they are not expected to have significant memory usage, 
-# to provide a complete picture of memory behavior across the entire execution of the commands.
-try:
-    from memory_profiler import profile # pyright: ignore[reportAssignmentType]
-except ImportError:
-    def profile(stream=None):
-        return lambda f: f
-    
-
-
-# Logging Setup for memory profiler (separate from the main logging used for command progress and info)
-os.makedirs("logs", exist_ok=True)
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-memory_profiler_logg_shrug = f"logs/memory_profiler_{timestamp}.log"
-memory_profiler_logg = open(memory_profiler_logg_shrug, "w")  # Open the log file for writing memory profiler output
 
 
 
@@ -75,7 +54,6 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # -----------------------------
 # Retry wrapper
 # -----------------------------
-@profile(stream=memory_profiler_logg)
 def get_file_with_retry(client: hydrus_api.Client, file_hash: str, retries: int = 5, delay: int = 5) -> Any:
     """Fetch a file from a Hydrus server with retry semantics.
 
@@ -138,7 +116,6 @@ kaomojis: list[str] = [
 
 
 @click.group()
-@profile(stream=memory_profiler_logg)
 def cli():
     """Top-level Click command group for the WD Hydrus Tagger CLI.
 
@@ -170,7 +147,6 @@ def cli():
               help="Hide tag output from cli")
 @click.option("--debug", is_flag=True, default=False,
               help="Show debug progress and pause before exit")
-@profile(stream=memory_profiler_logg)
 def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], token: str, cpu: bool,
                        model: str, threshold: float, host: str,
                        tag_service: str, ratings_only: bool, privacy: bool, debug: bool) -> None:
@@ -295,7 +271,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
     counterh = 1
     totalh = len(hashes)
-    @profile(stream=memory_profiler_logg)
+    
     def _show_idh(item) -> str:
         return f"{counterh}/{totalh}"
 
@@ -313,7 +289,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                 if not using_tag_search and file_hash in done_hashes:
                     continue
 
-                click.echo(" processing: " + file_hash)
+                click.echo("\nprocessing: " + file_hash)
                 logging.info(f"Processing: {file_hash}")
 
                 try:
@@ -441,7 +417,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
 
 
-@profile(stream=memory_profiler_logg)
+
 def process_frames_streaming(
     frame_generator: Iterator[PILImage],
     interrogator,
@@ -540,7 +516,6 @@ def process_frames_streaming(
               help="Hide tag output from cli")
 @click.option("--debug", is_flag=True, default=False,
               help="Show debug progress for video processing")
-@profile(stream=memory_profiler_logg)
 def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...], token: str, cpu: bool,
                              model: str, threshold: float, host: str,
                              tag_service: str, ratings_only: bool, privacy: bool, debug: bool) -> None:
@@ -672,7 +647,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
     counterh = 0
     totalh = len(hashes)
-    @profile(stream=memory_profiler_logg)
+    
     def _show_idh(item) -> str:
         return f"{counterh}/{totalh} Done"
 
@@ -689,22 +664,42 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 if not using_tag_search and file_hash in done_hashes:
                     continue
 
-                metadata = client.get_file_metadata(hashes=[file_hash])
-                file_info = metadata[0] # The API returns a list of metadata objects
 
-                # Extract the number of frames
-                # It will be None or absent for static images, so use .get()
-                num_frames = file_info.get('num_frames')
+                metadata = client.get_file_metadata(hashes=[file_hash])
+                # Use 'or 0' to catch cases where the key is missing OR the value is None
+                num_frames = metadata[0].get('num_frames') or 0
+                total_video_duration = metadata[0].get('duration') or 0
+
+                # Now it is safe to log and process
+                #logging.info(f"Metadata received: {metadata}")
+
+                def dynamic_threshold(total_video_frames: float, total_video_duration: float) -> float:
+                    duration_seconds = total_video_duration / 1000.0
+                    fps = total_video_frames / duration_seconds if duration_seconds > 0 else 30.0
+
+                    base = 0.75 * math.log(total_video_frames) - 4.0
+                    fps_adjust = 0.15 * math.log(max(fps, 1))
+
+                    t = base + fps_adjust
+                    return max(2.0, min(t, 50.0))
+
+                similarity_threshold_ff = 12.0
+                similarity_threshold_ff = dynamic_threshold(num_frames, total_video_duration)
 
                 if num_frames:
                     click.echo(f"\n  Processing {num_frames} frames for hash {file_hash}")
                     logging.info(f"Processing {num_frames} frames for hash {file_hash}")
+                    click.echo(f"  Similarity threshold > {similarity_threshold_ff:.2f}")
+                    logging.info(f"Similarity threshold > {similarity_threshold_ff:.2f}")
                 else:
                     click.echo(f"\n  File {file_hash} is a static image or has no frame count.")
                     logging.info(f"File {file_hash} is a static image or has no frame count.")
+                    click.echo(f"  Similarity threshold > {similarity_threshold_ff:.2f}")
+                    logging.info(f"Similarity threshold > {similarity_threshold_ff:.2f}")
 
 
                 try:
+                    click.echo(f"  [INFO] Fetching video from Hydrus: {file_hash}")
                     response: Any = get_file_with_retry(client, file_hash)
 
                 except hydrus_api.APIError as e:
@@ -730,7 +725,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     raise
 
                 # --- Frame Generators for RAM Efficiency ---
-                @profile(stream=memory_profiler_logg)
                 def pil_frame_gen(data: bytes):
                     count = 0
                     with Image.open(BytesIO(data)) as container:
@@ -741,7 +735,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             yield container.convert("RGB").resize((448, 448))
                     logging.info(f"[pil] Total frames extracted: {count} for {file_hash}")
 
-                @profile(stream=memory_profiler_logg)
+                
                 def ffmpeg_frame_gen(data: bytes, h: str, tmp_dir: Path):
                     count = 0
                     in_path = tmp_dir / f"vid_{h}"
@@ -771,9 +765,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 repo_tmp_dir = repo_root / "ffmpeg_temp"
                 repo_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-
-                # Threshold for frame selection (lower = more frames, higher = fewer frames)"
-                similarity_threshold_ff = 12.0
+                click.echo("  [INFO] Preparation complete.")
 
                 try:
                     # Test open once to verify it is PIL-compatible
@@ -795,9 +787,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 )
 
 
-                click.echo(f"Similarity threshold > {similarity_threshold_ff:.2f}")
                 click.echo(f"Kept and tagged {kept_frames} of {total_frames} frames")
-                logging.info(f"Similarity threshold > {similarity_threshold_ff:.2f}")
                 logging.info(f"Kept and tagged {kept_frames} of {total_frames} frames for {file_hash}")
                 click.echo()
 
@@ -888,7 +878,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 @click.option("--max-frames", default=0, type=int, help="Maximum frames to keep per threshold (0 = unlimited)")
 @click.option("--no-cache", is_flag=True, default=False, help="Store 64x64 frames on disk instead of RAM")
 @click.option("--debug", is_flag=True, default=False, help="Show debug output and keep extracted frames")
-@profile(stream=memory_profiler_logg)
 def video_similarity_calibration(
     file_hash: Optional[str],
     local_file: Optional[str],
@@ -912,10 +901,48 @@ def video_similarity_calibration(
 
     repo_root = Path(__file__).resolve().parents[1]
     repo_tmp_dir = repo_root / "ffmpeg_temp"
+    # NEU: Ein eigener Ordner nur für die Text-Zusammenfassungen
+    results_dir = repo_root / "summary_results" 
+    
     repo_tmp_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # 0. Datenquelle identifizieren
+    if file_hash:
+        label = file_hash
+    elif local_file:
+        p = Path(local_file)
+        if not p.exists():
+            click.echo(f"[ERROR] Local file not found: {local_file}")
+            return
+        label = p.stem
+        total_video_frames = 0 # Wird bei Videos später durch FFmpeg/Prob erkannt falls nötig
+    else:
+        raise ValueError("Provide --file-hash or --local-file")
+
+    summary_file = results_dir / f"summary_{label}.txt"
+
+    # 1. Bestehende Summary prüfen (Resume Logik)
+    already_tested = {}
+    if summary_file.exists():
+        click.echo(f"[INFO] Summary file found. Checking progress...")
+        with open(summary_file, "r", encoding="utf-8") as rf:
+            content = rf.read()
+            # Suche alle bereits fertigen Thresholds
+            matches = re.findall(r"Threshold\s+([0-9.]+):\s+selected\s+([0-9]+)", content)
+            for thr_str, sel_str in matches:
+                already_tested[float(thr_str)] = int(sel_str)
+        
+        # Abbruch falls der letzte Test bereits <= 1 Frame ergab
+        if already_tested:
+            last_thr = list(already_tested.keys())[-1]
+            if already_tested[last_thr] <= 1:
+                click.echo(f"[INFO] Last result for Thr {last_thr} was <= 1. Already finished.")
+                return
+
 
     try:
-        # 1. Datenquelle identifizieren
+        # 2. Datenquelle identifizieren
         if file_hash:
             client = hydrus_api.Client(token, host)
             try:
@@ -939,25 +966,6 @@ def video_similarity_calibration(
         else:
             raise ValueError("Provide --file-hash or --local-file")
 
-        summary_file = repo_tmp_dir / f"summary_{label}.txt"
-
-        # 2. Bestehende Summary prüfen (Resume Logik)
-        already_tested = {}
-        if summary_file.exists():
-            click.echo(f"[INFO] Summary file found. Checking progress...")
-            with open(summary_file, "r", encoding="utf-8") as rf:
-                content = rf.read()
-                # Suche alle bereits fertigen Thresholds
-                matches = re.findall(r"Threshold\s+([0-9.]+):\s+selected\s+([0-9]+)", content)
-                for thr_str, sel_str in matches:
-                    already_tested[float(thr_str)] = int(sel_str)
-            
-            # Abbruch falls der letzte Test bereits <= 1 Frame ergab
-            if already_tested:
-                last_thr = list(already_tested.keys())[-1]
-                if already_tested[last_thr] <= 1:
-                    click.echo(f"[INFO] Last result for Thr {last_thr} was <= 1. Already finished.")
-                    return
 
         # Header nur schreiben wenn Datei neu ist
         if not summary_file.exists():
