@@ -692,7 +692,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     scale_ratio = 448 / original_max_dim
                     
                     # 4. Threshold Logic
-                    base = 0.5 * math.log(max(total_video_frames, 1)) - 1.0
+                    base = 0.5 * math.log(max(total_video_frames, 1)) + 1.0
                     fps_adjust = 0.15 * math.log(max(fps, 1))
                     
                     # 5. Resolution Adjustment
@@ -721,7 +721,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
 
                 try:
-                    click.echo(f"  [INFO] Fetching video from Hydrus: {file_hash}")
+                    click.echo(f"  [INFO] Fetching video from Hydrus")
                     response: Any = get_file_with_retry(client, file_hash)
 
                 except hydrus_api.APIError as e:
@@ -787,7 +787,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                             yield f_img.convert("RGB")
                         p.unlink()
                     if in_path.exists(): in_path.unlink()
-                    logging.info(f"[ffmpeg] Total frames extracted: {count} for {file_hash}")
+                    logging.info(f"[ffmpeg] Total frames extracted: {count}")
 
                 repo_root = Path(__file__).resolve().parents[1]
                 repo_tmp_dir = repo_root / "ffmpeg_temp"
@@ -815,8 +815,8 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 )
 
 
-                click.echo(f"Kept and tagged {kept_frames} of {total_frames} frames")
-                logging.info(f"Kept and tagged {kept_frames} of {total_frames} frames for {file_hash}")
+                click.echo(f"tagged {kept_frames} of {total_frames} frames")
+                logging.info(f"tagged {kept_frames} of {total_frames} frames")
                 click.echo()
 
                 rating_priority = {
@@ -976,7 +976,7 @@ def video_similarity_calibration(
             try:
                 metadata = client.get_file_metadata(hashes=[file_hash])
                 total_video_frames = metadata[0].get('num_frames', 0)
-                click.echo(f"[INFO] Fetching video from Hydrus: {file_hash}")
+                click.echo(f"[INFO] Fetching video from Hydrus")
                 response = get_file_with_retry(client, file_hash)
                 content_bytes = response.content
                 label = file_hash
