@@ -447,7 +447,7 @@ def process_frames_streaming(
         frame_generator,
         length=total_video_frames,
         label="Filtering & Tagging Frames",
-        show_pos=False, # We disable show_pos because we are showing it in item_show_func
+        show_pos=False, # disable show_pos because we are showing it in item_show_func
         item_show_func=lambda _: f"Frame:{total_count}/{total_video_frames} Tagged:{kept_count}"
     ) as bar:
 
@@ -559,25 +559,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
     logging.info(f"Model: {model}")
     logging.info(f"CPU Mode: {cpu}")
     logging.info(f"Tag Service: {tag_service}")
-
-    # Clean up repository-local ffmpeg temporary files from previous runs
-    try:
-        repo_root = Path(__file__).resolve().parents[1]
-        repo_tmp_dir = repo_root / "ffmpeg_temp"
-        if repo_tmp_dir.exists():
-            for p in repo_tmp_dir.iterdir():
-                try:
-                    # Delete only folders starting with "deleted_"
-                    if p.is_dir() and p.name.startswith("deleted_"):
-                        shutil.rmtree(p)
-                     # Delete only files matching "frame_*.jpg"
-                    elif p.is_file() and p.name.startswith("frame_") and p.suffix == ".jpg":
-                        p.unlink()
-                except Exception:
-                    # ignore individual cleanup errors
-                    pass
-    except Exception:
-        logging.exception("Failed to clean ffmpeg_temp at startup")
         
 
     if not os.path.isfile('./model/' + model + '/info.json'):
@@ -673,11 +654,8 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 width = metadata[0].get('width') or 0
                 height = metadata[0].get('height') or 0
 
-                # Now it is safe to log and process
-                #logging.info(f"Metadata received: {metadata}")
-
                 def dynamic_threshold(total_video_frames: float, total_video_duration: float, width: int, height: int) -> float:
-                    # 1. Safety check for None/Zero values (prevents the crash you had)
+                    # 1. Safety check for None/Zero values
                     if not total_video_duration or not total_video_frames:
                         return 6.0 
 
@@ -686,7 +664,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     fps = total_video_frames / duration_seconds if duration_seconds > 0 else 30.0
 
                     # 3. Resolution Scaling Factor
-                    # We find which side was the 'limiting' side for the 448 scale
+                    # find which side was the 'limiting' side for the 448 scale
                     original_max_dim = max(width, height) if (width and height) else 448
                     # If the original is 1920, scale_ratio is ~0.23. If original is 200, it's 2.24.
                     scale_ratio = 448 / original_max_dim
@@ -764,7 +742,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     in_path.write_bytes(data)
 
                     del data
-                    gc.collect() # Erzwingt die sofortige Speicherfreigabe
+                    gc.collect()
 
 
                     out_pattern = str(tmp_dir / f"frame_{h}_%05d.jpg")
@@ -775,7 +753,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                     subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), 
                                     "-vf", "scale=448:448:flags=bicubic", 
-                                    "-pix_fmt", "rgb24",          # Entspricht .convert("RGB")
+                                    "-pix_fmt", "rgb24",
                                     "-fps_mode", "passthrough", 
                                     "-q:v", "2",
                                     out_pattern
@@ -929,13 +907,11 @@ def video_similarity_calibration(
 
     repo_root = Path(__file__).resolve().parents[1]
     repo_tmp_dir = repo_root / "ffmpeg_temp"
-    # NEU: Ein eigener Ordner nur für die Text-Zusammenfassungen
     results_dir = repo_root / "summary_results" 
     
     repo_tmp_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # 0. Datenquelle identifizieren
     if file_hash:
         label = file_hash
     elif local_file:
@@ -944,24 +920,21 @@ def video_similarity_calibration(
             click.echo(f"[ERROR] Local file not found: {local_file}")
             return
         label = p.stem
-        total_video_frames = 0 # Wird bei Videos später durch FFmpeg/Prob erkannt falls nötig
+        total_video_frames = 0 
     else:
         raise ValueError("Provide --file-hash or --local-file")
 
     summary_file = results_dir / f"summary_{label}.txt"
 
-    # 1. Bestehende Summary prüfen (Resume Logik)
     already_tested = {}
     if summary_file.exists():
         click.echo(f"[INFO] Summary file found. Checking progress...")
         with open(summary_file, "r", encoding="utf-8") as rf:
             content = rf.read()
-            # Suche alle bereits fertigen Thresholds
             matches = re.findall(r"Threshold\s+([0-9.]+):\s+selected\s+([0-9]+)", content)
             for thr_str, sel_str in matches:
                 already_tested[float(thr_str)] = int(sel_str)
         
-        # Abbruch falls der letzte Test bereits <= 1 Frame ergab
         if already_tested:
             last_thr = list(already_tested.keys())[-1]
             if already_tested[last_thr] <= 1:
@@ -970,7 +943,6 @@ def video_similarity_calibration(
 
 
     try:
-        # 2. Datenquelle identifizieren
         if file_hash:
             client = hydrus_api.Client(token, host)
             try:
@@ -990,76 +962,64 @@ def video_similarity_calibration(
                 return
             content_bytes = p.read_bytes()
             label = p.stem
-            total_video_frames = 0 # Wird bei Videos später durch FFmpeg/Prob erkannt falls nötig
+            total_video_frames = 0 
         else:
             raise ValueError("Provide --file-hash or --local-file")
 
 
-        # Header nur schreiben wenn Datei neu ist
         if not summary_file.exists():
             with open(summary_file, "w", encoding="utf-8") as sf:
                 sf.write(f"Calibration for: {label}\n")
                 sf.write(f"Total File frames: {total_video_frames}\n")
                 sf.write("-" * 30 + "\n")
 
-        # 3. Medien-Typ prüfen
         try:
             with Image.open(BytesIO(content_bytes)):
                 is_pil = True
         except UnidentifiedImageError:
             is_pil = False
 
-        # 4. Vorbereitung (FFmpeg oder PIL Extraktion)
         if not is_pil:
             click.echo(f"[INFO] Video detected. Extracting thumbnails via FFmpeg...")
             in_path = repo_tmp_dir / f"vid_{label}"
             in_path.write_bytes(content_bytes)
             
-            # WICHTIG: Originale Bytes aus dem RAM löschen, sobald sie auf Disk geschrieben wurden
             del content_bytes 
-            gc.collect() # Erzwingt die sofortige Speicherfreigabe
+            gc.collect()
 
             bundled_ffmpeg = repo_root / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
             ffmpeg_exe = str(bundled_ffmpeg) if bundled_ffmpeg.exists() else "ffmpeg"
 
             out_pattern = str(repo_tmp_dir / f"extract_{label}_%05d.jpg")
 
-            # 1. Extrahiere Frames in Arbeitsgröße
             subprocess.run([ffmpeg_exe, "-y", "-i", str(in_path), 
                             "-vf", "scale=448:448:flags=bicubic", 
-                            "-pix_fmt", "rgb24",          # Entspricht .convert("RGB")
+                            "-pix_fmt", "rgb24", 
                             "-fps_mode", "passthrough", 
                             "-q:v", "2",
                             out_pattern
                         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
-            # Video-Datei sofort löschen
             if in_path.exists(): 
                 in_path.unlink()
                 click.echo("[INFO] Temporary video file removed from disk.")
 
-            # 2. Frames verarbeiten (Resize auf 64x64 & Graustufen)
             extracted_files = sorted(repo_tmp_dir.glob(f"extract_{label}_*.jpg"))
             
             for p in extracted_files:
                 with Image.open(p) as tmp_img:
-                    # Konvertierung
                     small_img = tmp_img.convert("L").resize((64, 64))
                     
                     if no_cache:
-                        # Speichere die winzige Version für späteren Festplatten-Zugriff
                         target_path = repo_tmp_dir / f"small_{label}_{p.name.split('_')[-1]}"
                         small_img.save(target_path, "JPEG", quality=90)
                     else:
-                        # Behalte die winzige Version im RAM
                         ram_cache.append(small_img)
                 
-                # Lösche das große 448x448 Frame sofort
                 p.unlink()
 
             click.echo(f"[INFO] Preparation complete. {'Disk' if no_cache else 'RAM'} cache ready.")
 
-        # 5. Calibration Loop
         similarity_list = [float(s.strip()) for s in similarity.split(",") if s.strip()]
 
         for thr in similarity_list:
@@ -1112,14 +1072,12 @@ def video_similarity_calibration(
                     
                     if no_cache: small_img.close()
 
-            # Ergebnis speichern
             with open(summary_file, "a", encoding="utf-8") as sf:
                 sf.write(f"Threshold {thr}: selected {current_kept} frames (from {current_total})\n")
 
             click.echo(f"[RESULT] Threshold {thr}: {current_kept} frames selected.")
             processed_count += 1
             
-            # Wenn nur noch 1 Frame übrig ist (der erste), macht weitermachen keinen Sinn
             if current_kept <= 1:
                 click.echo("[INFO] Stop: Threshold too high (selected <= 1).")
                 break
