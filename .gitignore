@@ -3,21 +3,16 @@ wd-hydrus-tagger/__pycache__/*
 wd_hydrus_tagger.egg-info/*
 dist/*
 .idea
-onnx
-tmp
-bad-hashes.txt
-done-hashes-WD EVA02-Large v3 Tagger.txt
-done-hashes-WD V1.4 Vit V2 Tagger.txt
-done-hashes-Z3D E621 Convnext Tagger.txt
-hashes.txt
-log.txt
-*.onnx
-*.csv
-redo
-logs
+.vscode
 ffmpeg
 ffmpeg_temp
-.vscode
-wd-hydrus-tagger/__main__ai-edit.py
+logs
+logs
+*.onnx
+selected_tags.csv
+tags-selected.csv
 notes
 summary_results
+hashes.txt
+menu.bat
+start_menu_in_venv.bat
