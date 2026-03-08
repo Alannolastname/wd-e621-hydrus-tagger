@@ -570,7 +570,8 @@ def process_frames_streaming(
 
         if reasons:
             tag_record["reasons"] = reasons
-            tag_record["rank_if_sorted_by_score"] = rank_by_tag[tag]
+            if debug:
+                tag_record["rank_if_sorted_by_score"] = rank_by_tag[tag]
             rejected_tags[tag] = tag_record
         else:
             clipped_tags[tag] = d["final_score"]
@@ -1033,4 +1034,3 @@ if __name__ == '__main__':
     cli.add_command(evaluate_api_batch) # pyright: ignore[reportFunctionMemberAccess]
     cli.add_command(evaluate_api_batch_video) # pyright: ignore[reportFunctionMemberAccess]
     cli()
-
