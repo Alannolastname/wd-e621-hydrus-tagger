@@ -37,6 +37,8 @@ import subprocess
 from pathlib import Path
 import gc
 import math
+import threading
+import sys
 
 
 
@@ -66,6 +68,117 @@ kaomojis: list[str] = [
     "|_|",
     "||_||",
 ]
+
+
+# -----------------------------
+# Pause / Soft-quit controller
+# -----------------------------
+class BatchController:
+    """Hashcat-style pause and soft-quit controller.
+
+    Runs a background daemon thread that reads single-character commands from
+    stdin. The main processing loop should call :py:meth:`check` between files
+    to honour any pending commands.
+
+    Commands (press key then Enter):
+      ``p`` — pause; the loop blocks until the user presses Enter to resume.
+      ``q`` — soft quit; the current file finishes cleanly then the loop exits.
+    """
+
+    def __init__(self) -> None:
+        self._pause = threading.Event()
+        self._quit = threading.Event()
+        self._lock = threading.Lock()
+        self._quit_notified_in_frames = False
+        self._thread = threading.Thread(target=self._listen, daemon=True)
+        self._thread.start()
+        click.echo("[*] Pause/quit controls active — press 'p'+Enter to pause, 'q'+Enter to quit cleanly.")
+
+    def _listen(self) -> None:
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            cmd = line.strip().lower()
+            if cmd == "p":
+                with self._lock:
+                    self._pause.set()
+            elif cmd == "q":
+                with self._lock:
+                    if self._quit.is_set():
+                        self._quit.clear()
+                        self._quit_notified_in_frames = False
+                        click.echo("\n[*] Quit disengaged — will continue after current file.")
+                        logging.info("Quit disengaged by user.")
+                    else:
+                        self._quit.set()
+                        self._quit_notified_in_frames = False
+                        click.echo("\n[*] Quit engaged — will stop cleanly after current file/frame batch. Press 'q'+Enter again to cancel.")
+                        logging.info("Quit engaged by user.")
+
+    def check_pause(self) -> None:
+        """Block if a pause is pending, then clear it and resume.
+
+        Also displays a reminder if quit is currently engaged, so the user gets
+        feedback inside long frame-processing loops without having to wait for
+        the next inter-file check.
+
+        Intended for use inside tight inner loops (e.g. per-frame processing)
+        where quit is not actionable mid-stream but pause/quit status should
+        still respond immediately.
+        """
+        if self._pause.is_set():
+            click.echo("\n[*] Paused mid-frame. Press Enter to resume...")
+            logging.info("PAUSED mid-frame.")
+            try:
+                sys.stdin.readline()
+            except Exception:
+                pass
+            self._pause.clear()
+            if self._quit.is_set():
+                click.echo("[*] Resuming frames... (quit still engaged — will stop after this file)")
+            else:
+                click.echo("[*] Resuming frames...")
+            logging.info("Resuming frames.")
+        elif self._quit.is_set() and not self._quit_notified_in_frames:
+            self._quit_notified_in_frames = True
+            click.echo("\n[*] Quit engaged — finishing this file's frames then stopping.")
+
+    def check(self, processed_count: int, total: int) -> bool:
+        """Check for pending pause/quit commands.
+
+        Should be called once per iteration of the main processing loop,
+        *after* the current file has been successfully handled (tags written,
+        done-hash recorded).
+
+        :param processed_count: Number of files processed so far (for display).
+        :param total: Total number of files in the batch (for display).
+        :returns: ``True`` if the loop should stop (soft quit requested),
+            ``False`` to continue.
+        """
+        if self._pause.is_set():
+            click.echo(f"\n[*] Paused after {processed_count}/{total} files. Press Enter to resume...")
+            logging.info(f"PAUSED after {processed_count} files.")
+            try:
+                sys.stdin.readline()
+            except Exception:
+                pass
+            self._pause.clear()
+            if self._quit.is_set():
+                click.echo("[*] Resuming... (quit still engaged — will stop after next file)")
+            else:
+                click.echo("[*] Resuming...")
+            logging.info("Resuming.")
+
+        if self._quit.is_set():
+            click.echo(f"\n[*] Soft quit: stopping cleanly after {processed_count}/{total} files.")
+            logging.info(f"SOFT QUIT actioned after {processed_count} files.")
+            return True
+
+        return False
 
 
 # -----------------------------
@@ -266,6 +379,8 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
     processed_count = 0
     interrupted = False
 
+    controller = BatchController()
+
     counterh = 1
     totalh = len(hashes)
     
@@ -387,6 +502,11 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                     time.sleep(3)
                     logging.info(f"Processed {processed_count} files")
 
+                # --- Pause / soft-quit check ---
+                if controller.check(processed_count, totalh):
+                    interrupted = True
+                    break
+
     except KeyboardInterrupt:
         interrupted = True
         click.echo("\n[!] Interrupted by user (Ctrl+C)")
@@ -427,11 +547,15 @@ def process_frames_streaming(
     similarity_threshold: float,
     threshold: float,
     ratingsflag: bool,
-    debug
+    debug,
+    controller: Optional["BatchController"] = None,
 ):
     """
     True streaming frame processor with live progress bar.
     No frame list is stored.
+
+    If ``controller`` is provided, :py:meth:`BatchController.check_pause` is
+    called after each frame so that a ``p`` keypress pauses mid-video.
     """
 
     agg_ratings: dict[str, float] = {}
@@ -475,6 +599,8 @@ def process_frames_streaming(
             if not keep_frame:
                 small.close()
                 img.close()
+                if controller is not None:
+                    controller.check_pause()
                 continue
 
             # Frame is being kept/tagged
@@ -510,6 +636,9 @@ def process_frames_streaming(
                         agg_ratings[r] = max(agg_ratings.get(r, 0.0), score)
 
             img.close()
+
+            if controller is not None:
+                controller.check_pause()
 
 
     if last_small is not None:
@@ -836,6 +965,8 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
     processed_count = 0
     interrupted = False
 
+    controller = BatchController()
+
     counterh = 0
     totalh = len(hashes)
     
@@ -940,7 +1071,8 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     similarity_threshold=similarity_threshold_ff,
                     threshold=threshold,
                     ratingsflag=modelinfo['ratingsflag'],
-                    debug=debug
+                    debug=debug,
+                    controller=controller,
                 )
 
 
@@ -999,6 +1131,11 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 if processed_count % 25 == 0:
                     time.sleep(3)
                     logging.info(f"Processed {processed_count} files")
+
+                # --- Pause / soft-quit check ---
+                if controller.check(processed_count, totalh):
+                    interrupted = True
+                    break
 
     except KeyboardInterrupt:
         interrupted = True
