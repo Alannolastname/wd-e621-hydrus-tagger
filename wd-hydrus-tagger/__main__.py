@@ -74,72 +74,87 @@ kaomojis: list[str] = [
 # Pause / Soft-quit controller
 # -----------------------------
 
-# ANSI helpers for the sticky legend
-_ANSI_SAVE    = "\033[s"          # save cursor position
-_ANSI_RESTORE = "\033[u"          # restore cursor position
-_ANSI_CLEAR_LINE = "\033[2K"      # erase entire current line
 _LEGEND = (
     "[ p ] pause    [ k ] skip file    [ s ] status    "
     "[ q ] quit (toggle)    [ Ctrl+C ] hard stop"
 )
 
 def _draw_legend() -> None:
-    """Print the sticky legend at the current cursor position."""
-    # Move to a fresh line, print the legend, then return the cursor so normal
-    # output continues above it.  We intentionally do NOT use save/restore here
-    # because Click's progressbar manages its own cursor; instead we just emit
-    # the legend on its own line and rely on callers to newline before it.
-    sys.stderr.write(f"\n\033[2K{_LEGEND}\n")
+    """Print the sticky legend on its own line (stderr, does not interfere with
+    Click's stdout progressbar).  Only called reactively — never at startup —
+    so it always appears directly below the last output line."""
+    sys.stderr.write(f"\033[2K{_LEGEND}\n")
     sys.stderr.flush()
 
 def _erase_legend() -> None:
-    """Erase the legend line (called before printing status output)."""
-    # Move up one line (the legend), clear it, then move up again so output
-    # lands where the legend was.
-    sys.stderr.write("\033[1A\033[2K\033[1A\033[2K")
+    """Move up one line and erase it (removes the legend before new output)."""
+    sys.stderr.write("\033[1A\033[2K")
     sys.stderr.flush()
 
 def _redraw_legend() -> None:
-    """Erase and redraw — use after any multi-line output block."""
     _draw_legend()
 
 
 class BatchController:
     """Hashcat-style interactive batch controller.
 
-    Background daemon thread reads lines from stdin and sets event flags.
-    The main loop calls :py:meth:`check` between files; the frame loop calls
-    :py:meth:`check_pause` each frame.
+    Background daemon thread reads lines from stdin and dispatches commands
+    without blocking the main processing loop.
+
+    Fix summary vs previous version:
+    - Legend is NEVER drawn at __init__ time; only drawn reactively after each
+      output block, so it always sits directly below real content.
+    - Pause uses a threading.Event (_resume) as the resume signal so the
+      listener thread keeps processing commands (s, q, k) while paused instead
+      of having a raw readline() swallow them.
+    - Frame progress (kept/total) is tracked via mutable refs passed in by
+      process_frames_streaming and rendered in print_status ourselves — Click's
+      progressbar string is never captured or embedded.
+    - Duplicate quit message removed: _listen already prints immediately on q;
+      check_pause only logs, never echoes the quit-engaged notice.
 
     Commands (key + Enter):
       ``p`` — pause / resume
-      ``k`` — skip current file (frame loop finishes, tags are NOT written)
-      ``s`` — print a status snapshot immediately
-      ``q`` — soft quit toggle (press again to cancel)
+      ``k`` — skip current file
+      ``s`` — print status snapshot
+      ``q`` — soft quit toggle
     """
 
     def __init__(self, total: int, processed_count_ref: list) -> None:
         """
-        :param total: Total number of hashes in this run (for status display).
-        :param processed_count_ref: A one-element list holding the current
-            processed count so the listener thread can read it for status
-            without needing a lock.
+        :param total: Total hashes in this run.
+        :param processed_count_ref: One-element list ``[processed_count]``
+            updated by the main loop; read by print_status without locking.
         """
         self._pause   = threading.Event()
+        self._resume  = threading.Event()   # set by listener to unblock pause
         self._quit    = threading.Event()
         self._skip    = threading.Event()
         self._status  = threading.Event()
         self._lock    = threading.Lock()
-        self._quit_notified_in_frames = False
         self._total   = total
-        self._count_ref = processed_count_ref   # [processed_count]
+        self._count_ref = processed_count_ref
+        # Frame-level progress refs — set by process_frames_streaming
+        self._frame_kept_ref:  list = [0]
+        self._frame_total_ref: list = [0]
+        self._in_frames = False             # True while inside frame loop
         self.start_time = time.monotonic()
         self._thread  = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
-        _draw_legend()
 
     # ------------------------------------------------------------------
-    # Background listener
+    # Called by process_frames_streaming to share its counters
+    # ------------------------------------------------------------------
+    def attach_frame_refs(self, kept_ref: list, total_ref: list) -> None:
+        self._frame_kept_ref  = kept_ref
+        self._frame_total_ref = total_ref
+        self._in_frames = True
+
+    def detach_frame_refs(self) -> None:
+        self._in_frames = False
+
+    # ------------------------------------------------------------------
+    # Background listener — runs commands while the main thread is busy
     # ------------------------------------------------------------------
     def _listen(self) -> None:
         while True:
@@ -150,33 +165,41 @@ class BatchController:
             if not line:
                 break
             cmd = line.strip().lower()
+
             if cmd == "p":
-                with self._lock:
+                if self._pause.is_set():
+                    # already paused — p again resumes
+                    self._resume.set()
+                else:
                     self._pause.set()
+                    self._resume.clear()
+
             elif cmd == "k":
-                with self._lock:
-                    self._skip.set()
+                self._skip.set()
                 _erase_legend()
                 click.echo("[>] Skip requested — will finish current file then move on.")
                 logging.info("Skip requested by user.")
                 _redraw_legend()
+
             elif cmd == "s":
-                with self._lock:
-                    self._status.set()
+                # Trigger immediate status print from listener thread
+                self._print_status_now()
+
             elif cmd == "q":
                 with self._lock:
                     if self._quit.is_set():
                         self._quit.clear()
-                        self._quit_notified_in_frames = False
                         _erase_legend()
                         click.echo("[*] Quit disengaged — will continue after current file.")
                         logging.info("Quit disengaged by user.")
                         _redraw_legend()
                     else:
                         self._quit.set()
-                        self._quit_notified_in_frames = False
                         _erase_legend()
-                        click.echo("[*] Quit engaged — will stop after current file/frame batch.  Press 'q'+Enter again to cancel.")
+                        click.echo(
+                            "[*] Quit engaged — will stop after current file/frame batch. "
+                            "Press 'q'+Enter again to cancel."
+                        )
                         logging.info("Quit engaged by user.")
                         _redraw_legend()
 
@@ -190,23 +213,29 @@ class BatchController:
         self._skip.clear()
 
     def reset_quit_frame_notification(self) -> None:
-        """Call at the start of each new file so the mid-frame quit notice fires once per file."""
-        self._quit_notified_in_frames = False
+        """No-op — kept for call-site compatibility; duplicate echo removed."""
+        pass
 
-    def print_status(self, current_hash: str = "") -> None:
-        """Print a one-shot status snapshot (triggered by 's' or periodic timer)."""
-        elapsed   = time.monotonic() - self.start_time
-        done      = self._count_ref[0]
-        total     = self._total
-        remaining = total - done
-        rate      = done / elapsed if elapsed > 0 else 0.0
-        eta_secs  = remaining / rate if rate > 0 else 0.0
-        eta_str   = time.strftime("%H:%M:%S", time.gmtime(eta_secs)) if rate > 0 else "--:--:--"
+    def _print_status_now(self, current_hash: str = "") -> None:
+        """Internal — may be called from listener thread or main thread."""
+        elapsed     = time.monotonic() - self.start_time
+        done        = self._count_ref[0]
+        total       = self._total
+        remaining   = total - done
+        rate        = done / elapsed if elapsed > 0 else 0.0
+        eta_secs    = remaining / rate if rate > 0 else 0.0
+        eta_str     = time.strftime("%H:%M:%S", time.gmtime(eta_secs)) if rate > 0 else "--:--:--"
         elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
 
-        quit_flag  = "YES" if self._quit.is_set() else "no"
-        skip_flag  = "YES" if self._skip.is_set() else "no"
+        quit_flag  = "YES" if self._quit.is_set()  else "no"
+        skip_flag  = "YES" if self._skip.is_set()  else "no"
         pause_flag = "YES" if self._pause.is_set() else "no"
+
+        frame_line = ""
+        if self._in_frames:
+            fk = self._frame_kept_ref[0]
+            ft = self._frame_total_ref[0]
+            frame_line = f"│  Frames   : {ft} processed  {fk} tagged\n"
 
         _erase_legend()
         click.echo(
@@ -215,6 +244,7 @@ class BatchController:
             f"│  Elapsed  : {elapsed_str}    ETA : {eta_str}\n"
             f"│  Rate     : {rate:.1f} files/s  ({rate*3600:.0f} files/hr)\n"
             f"│  Current  : {current_hash or '(between files)'}\n"
+            f"{frame_line}"
             f"│  Quit     : {quit_flag}   Skip : {skip_flag}   Pause : {pause_flag}\n"
             f"└───────────────────────────────────────────────"
         )
@@ -224,28 +254,27 @@ class BatchController:
         )
         _redraw_legend()
 
-    # ------------------------------------------------------------------
-    # Called inside the frame loop
-    # ------------------------------------------------------------------
-    def check_pause(self, current_hash: str = "") -> None:
-        """Handle pause, status and quit-notification inside the frame loop.
+    def print_status(self, current_hash: str = "") -> None:
+        """Public wrapper — called by the main loop for periodic auto-status."""
+        self._print_status_now(current_hash)
 
-        Does NOT act on quit (the file finishes first) but does display the
-        quit-engaged reminder once per file so the user gets feedback
-        immediately even during a long video.
+    # ------------------------------------------------------------------
+    # Called inside the frame loop (every frame)
+    # ------------------------------------------------------------------
+    def check_pause(self, current_hash: str = "") -> bool:
+        """Handle pause inside the frame loop.
+
+        Also checks for a skip request so the frame loop can break early.
+
+        :returns: ``True`` if skip was requested and the frame loop should stop.
         """
-        if self._status.is_set():
-            self._status.clear()
-            self.print_status(current_hash)
-
         if self._pause.is_set():
             _erase_legend()
-            click.echo("\n[*] Paused mid-frame. Press Enter to resume...")
+            click.echo("\n[*] Paused mid-frame. Press 'p'+Enter to resume...")
             logging.info("PAUSED mid-frame.")
-            try:
-                sys.stdin.readline()
-            except Exception:
-                pass
+            # Block until listener sets _resume via 'p'+Enter
+            self._resume.wait()
+            self._resume.clear()
             self._pause.clear()
             if self._quit.is_set():
                 click.echo("[*] Resuming frames... (quit still engaged — will stop after this file)")
@@ -254,11 +283,11 @@ class BatchController:
             logging.info("Resuming frames.")
             _redraw_legend()
 
-        elif self._quit.is_set() and not self._quit_notified_in_frames:
-            self._quit_notified_in_frames = True
-            _erase_legend()
-            click.echo("\n[*] Quit engaged — finishing this file's frames then stopping.")
-            _redraw_legend()
+        elif self._quit.is_set():
+            # Just log — _listen already printed the message on key press
+            logging.debug(f"Quit engaged, continuing frames for {current_hash}")
+
+        return self._skip.is_set()
 
     # ------------------------------------------------------------------
     # Called between files
@@ -266,22 +295,17 @@ class BatchController:
     def check(self, processed_count: int, current_hash: str = "") -> bool:
         """Handle all pending commands between files.
 
-        :param processed_count: Files successfully processed so far.
-        :param current_hash: Hash just finished (for status display).
-        :returns: ``True`` if the loop should stop (quit requested).
+        :returns: ``True`` if the loop should stop.
         """
-        if self._status.is_set():
-            self._status.clear()
-            self.print_status(current_hash)
-
         if self._pause.is_set():
             _erase_legend()
-            click.echo(f"\n[*] Paused after {processed_count}/{self._total} files. Press Enter to resume...")
+            click.echo(
+                f"\n[*] Paused after {processed_count}/{self._total} files. "
+                "Press 'p'+Enter to resume..."
+            )
             logging.info(f"PAUSED after {processed_count} files.")
-            try:
-                sys.stdin.readline()
-            except Exception:
-                pass
+            self._resume.wait()
+            self._resume.clear()
             self._pause.clear()
             if self._quit.is_set():
                 click.echo("[*] Resuming... (quit still engaged — will stop after next file)")
@@ -605,6 +629,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
     count_ref = [0]   # mutable ref so BatchController can read live value
     controller = BatchController(total=totalh, processed_count_ref=count_ref)
+    _draw_legend()  # first draw — reactively from here on
 
     last_status_count = 0   # for periodic auto-status every 50 files
     current_hash = ""
@@ -811,29 +836,32 @@ def process_frames_streaming(
     """
 
     agg_ratings: dict[str, float] = {}
-
     tag_stats = {}
-
     COLLECTION_THRESHOLD = threshold * 0.65
-
-
     last_small: Optional[PILImage] = None
     kept_count = 0
     total_count = 0
 
+    # Mutable refs so BatchController.print_status can read live frame progress
+    kept_ref  = [0]
+    total_ref = [0]
+    if controller is not None:
+        controller.attach_frame_refs(kept_ref, total_ref)
 
-    with click.progressbar(
-        frame_generator,
-        length=metadata_frames,
-        label="Filtering & Tagging Frames",
-        show_pos=False, # disable show_pos because we are showing it in item_show_func
-        item_show_func=lambda _: f"Frame:{total_count}/{metadata_frames} Tagged:{kept_count}"
-    ) as bar:
-
-        for img in bar:
+    try:
+        for img in frame_generator:
             total_count += 1
-            # Update the bar text every iteration
-            bar.update(0) 
+            total_ref[0] = total_count
+
+            # In-place progress line — we own this cursor row entirely
+            pct = int(total_count / metadata_frames * 100) if metadata_frames else 0
+            bar_filled = int(pct / 2)
+            bar_str = "#" * bar_filled + "-" * (50 - bar_filled)
+            sys.stdout.write(
+                f"\r  [{bar_str}] {pct:3d}%  "
+                f"Frame:{total_count}/{metadata_frames}  Tagged:{kept_count}  "
+            )
+            sys.stdout.flush()
 
             # similarity check
             small = img.resize((64, 64)).convert("L")
@@ -852,12 +880,14 @@ def process_frames_streaming(
                 small.close()
                 img.close()
                 if controller is not None:
-                    controller.check_pause(file_hash)
+                    if controller.check_pause(file_hash):
+                        break   # skip requested mid-frame — exit generator loop
                 continue
 
             # Frame is being kept/tagged
             kept_count += 1
-            
+            kept_ref[0] = kept_count
+
             if last_small is not None:
                 last_small.close()
             last_small = small
@@ -866,20 +896,13 @@ def process_frames_streaming(
 
             for t, s in tags.items():
                 score = float(s)
-
                 if score > COLLECTION_THRESHOLD:
-
                     if t not in tag_stats:
-                        tag_stats[t] = {
-                            "max": score,
-                            "sum": score,
-                            "count": 1
-                        }
+                        tag_stats[t] = {"max": score, "sum": score, "count": 1}
                     else:
                         tag_stats[t]["max"] = max(tag_stats[t]["max"], score)
                         tag_stats[t]["sum"] += score
                         tag_stats[t]["count"] += 1
-
 
             if ratingsflag:
                 for r, s in ratings.items():
@@ -890,7 +913,16 @@ def process_frames_streaming(
             img.close()
 
             if controller is not None:
-                controller.check_pause(file_hash)
+                if controller.check_pause(file_hash):
+                    break   # skip requested mid-frame — exit generator loop
+
+        # Finish the progress line cleanly
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    finally:
+        if controller is not None:
+            controller.detach_frame_refs()
 
 
     if last_small is not None:
@@ -1236,6 +1268,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
     count_ref = [0]
     controller = BatchController(total=totalh, processed_count_ref=count_ref)
+    _draw_legend()  # first draw — reactively from here on
 
     last_status_count = 0
     current_hash = ""
