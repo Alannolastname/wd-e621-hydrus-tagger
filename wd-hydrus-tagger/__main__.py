@@ -73,27 +73,74 @@ kaomojis: list[str] = [
 # -----------------------------
 # Pause / Soft-quit controller
 # -----------------------------
+
+# ANSI helpers for the sticky legend
+_ANSI_SAVE    = "\033[s"          # save cursor position
+_ANSI_RESTORE = "\033[u"          # restore cursor position
+_ANSI_CLEAR_LINE = "\033[2K"      # erase entire current line
+_LEGEND = (
+    "[ p ] pause    [ k ] skip file    [ s ] status    "
+    "[ q ] quit (toggle)    [ Ctrl+C ] hard stop"
+)
+
+def _draw_legend() -> None:
+    """Print the sticky legend at the current cursor position."""
+    # Move to a fresh line, print the legend, then return the cursor so normal
+    # output continues above it.  We intentionally do NOT use save/restore here
+    # because Click's progressbar manages its own cursor; instead we just emit
+    # the legend on its own line and rely on callers to newline before it.
+    sys.stderr.write(f"\n\033[2K{_LEGEND}\n")
+    sys.stderr.flush()
+
+def _erase_legend() -> None:
+    """Erase the legend line (called before printing status output)."""
+    # Move up one line (the legend), clear it, then move up again so output
+    # lands where the legend was.
+    sys.stderr.write("\033[1A\033[2K\033[1A\033[2K")
+    sys.stderr.flush()
+
+def _redraw_legend() -> None:
+    """Erase and redraw — use after any multi-line output block."""
+    _draw_legend()
+
+
 class BatchController:
-    """Hashcat-style pause and soft-quit controller.
+    """Hashcat-style interactive batch controller.
 
-    Runs a background daemon thread that reads single-character commands from
-    stdin. The main processing loop should call :py:meth:`check` between files
-    to honour any pending commands.
+    Background daemon thread reads lines from stdin and sets event flags.
+    The main loop calls :py:meth:`check` between files; the frame loop calls
+    :py:meth:`check_pause` each frame.
 
-    Commands (press key then Enter):
-      ``p`` — pause; the loop blocks until the user presses Enter to resume.
-      ``q`` — soft quit; the current file finishes cleanly then the loop exits.
+    Commands (key + Enter):
+      ``p`` — pause / resume
+      ``k`` — skip current file (frame loop finishes, tags are NOT written)
+      ``s`` — print a status snapshot immediately
+      ``q`` — soft quit toggle (press again to cancel)
     """
 
-    def __init__(self) -> None:
-        self._pause = threading.Event()
-        self._quit = threading.Event()
-        self._lock = threading.Lock()
+    def __init__(self, total: int, processed_count_ref: list) -> None:
+        """
+        :param total: Total number of hashes in this run (for status display).
+        :param processed_count_ref: A one-element list holding the current
+            processed count so the listener thread can read it for status
+            without needing a lock.
+        """
+        self._pause   = threading.Event()
+        self._quit    = threading.Event()
+        self._skip    = threading.Event()
+        self._status  = threading.Event()
+        self._lock    = threading.Lock()
         self._quit_notified_in_frames = False
-        self._thread = threading.Thread(target=self._listen, daemon=True)
+        self._total   = total
+        self._count_ref = processed_count_ref   # [processed_count]
+        self.start_time = time.monotonic()
+        self._thread  = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
-        click.echo("[*] Pause/quit controls active — press 'p'+Enter to pause, 'q'+Enter to quit cleanly.")
+        _draw_legend()
 
+    # ------------------------------------------------------------------
+    # Background listener
+    # ------------------------------------------------------------------
     def _listen(self) -> None:
         while True:
             try:
@@ -106,31 +153,93 @@ class BatchController:
             if cmd == "p":
                 with self._lock:
                     self._pause.set()
+            elif cmd == "k":
+                with self._lock:
+                    self._skip.set()
+                _erase_legend()
+                click.echo("[>] Skip requested — will finish current file then move on.")
+                logging.info("Skip requested by user.")
+                _redraw_legend()
+            elif cmd == "s":
+                with self._lock:
+                    self._status.set()
             elif cmd == "q":
                 with self._lock:
                     if self._quit.is_set():
                         self._quit.clear()
                         self._quit_notified_in_frames = False
-                        click.echo("\n[*] Quit disengaged — will continue after current file.")
+                        _erase_legend()
+                        click.echo("[*] Quit disengaged — will continue after current file.")
                         logging.info("Quit disengaged by user.")
+                        _redraw_legend()
                     else:
                         self._quit.set()
                         self._quit_notified_in_frames = False
-                        click.echo("\n[*] Quit engaged — will stop cleanly after current file/frame batch. Press 'q'+Enter again to cancel.")
+                        _erase_legend()
+                        click.echo("[*] Quit engaged — will stop after current file/frame batch.  Press 'q'+Enter again to cancel.")
                         logging.info("Quit engaged by user.")
+                        _redraw_legend()
 
-    def check_pause(self) -> None:
-        """Block if a pause is pending, then clear it and resume.
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+    def is_skip_requested(self) -> bool:
+        return self._skip.is_set()
 
-        Also displays a reminder if quit is currently engaged, so the user gets
-        feedback inside long frame-processing loops without having to wait for
-        the next inter-file check.
+    def clear_skip(self) -> None:
+        self._skip.clear()
 
-        Intended for use inside tight inner loops (e.g. per-frame processing)
-        where quit is not actionable mid-stream but pause/quit status should
-        still respond immediately.
+    def reset_quit_frame_notification(self) -> None:
+        """Call at the start of each new file so the mid-frame quit notice fires once per file."""
+        self._quit_notified_in_frames = False
+
+    def print_status(self, current_hash: str = "") -> None:
+        """Print a one-shot status snapshot (triggered by 's' or periodic timer)."""
+        elapsed   = time.monotonic() - self.start_time
+        done      = self._count_ref[0]
+        total     = self._total
+        remaining = total - done
+        rate      = done / elapsed if elapsed > 0 else 0.0
+        eta_secs  = remaining / rate if rate > 0 else 0.0
+        eta_str   = time.strftime("%H:%M:%S", time.gmtime(eta_secs)) if rate > 0 else "--:--:--"
+        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+
+        quit_flag  = "YES" if self._quit.is_set() else "no"
+        skip_flag  = "YES" if self._skip.is_set() else "no"
+        pause_flag = "YES" if self._pause.is_set() else "no"
+
+        _erase_legend()
+        click.echo(
+            f"\n┌─ Status ──────────────────────────────────────\n"
+            f"│  Progress : {done}/{total} files\n"
+            f"│  Elapsed  : {elapsed_str}    ETA : {eta_str}\n"
+            f"│  Rate     : {rate:.1f} files/s  ({rate*3600:.0f} files/hr)\n"
+            f"│  Current  : {current_hash or '(between files)'}\n"
+            f"│  Quit     : {quit_flag}   Skip : {skip_flag}   Pause : {pause_flag}\n"
+            f"└───────────────────────────────────────────────"
+        )
+        logging.info(
+            f"STATUS: {done}/{total} | elapsed {elapsed_str} | ETA {eta_str} "
+            f"| {rate:.2f} f/s | quit={quit_flag}"
+        )
+        _redraw_legend()
+
+    # ------------------------------------------------------------------
+    # Called inside the frame loop
+    # ------------------------------------------------------------------
+    def check_pause(self, current_hash: str = "") -> None:
+        """Handle pause, status and quit-notification inside the frame loop.
+
+        Does NOT act on quit (the file finishes first) but does display the
+        quit-engaged reminder once per file so the user gets feedback
+        immediately even during a long video.
         """
+        if self._status.is_set():
+            self._status.clear()
+            self.print_status(current_hash)
+
         if self._pause.is_set():
+            _erase_legend()
             click.echo("\n[*] Paused mid-frame. Press Enter to resume...")
             logging.info("PAUSED mid-frame.")
             try:
@@ -143,24 +252,31 @@ class BatchController:
             else:
                 click.echo("[*] Resuming frames...")
             logging.info("Resuming frames.")
+            _redraw_legend()
+
         elif self._quit.is_set() and not self._quit_notified_in_frames:
             self._quit_notified_in_frames = True
+            _erase_legend()
             click.echo("\n[*] Quit engaged — finishing this file's frames then stopping.")
+            _redraw_legend()
 
-    def check(self, processed_count: int, total: int) -> bool:
-        """Check for pending pause/quit commands.
+    # ------------------------------------------------------------------
+    # Called between files
+    # ------------------------------------------------------------------
+    def check(self, processed_count: int, current_hash: str = "") -> bool:
+        """Handle all pending commands between files.
 
-        Should be called once per iteration of the main processing loop,
-        *after* the current file has been successfully handled (tags written,
-        done-hash recorded).
-
-        :param processed_count: Number of files processed so far (for display).
-        :param total: Total number of files in the batch (for display).
-        :returns: ``True`` if the loop should stop (soft quit requested),
-            ``False`` to continue.
+        :param processed_count: Files successfully processed so far.
+        :param current_hash: Hash just finished (for status display).
+        :returns: ``True`` if the loop should stop (quit requested).
         """
+        if self._status.is_set():
+            self._status.clear()
+            self.print_status(current_hash)
+
         if self._pause.is_set():
-            click.echo(f"\n[*] Paused after {processed_count}/{total} files. Press Enter to resume...")
+            _erase_legend()
+            click.echo(f"\n[*] Paused after {processed_count}/{self._total} files. Press Enter to resume...")
             logging.info(f"PAUSED after {processed_count} files.")
             try:
                 sys.stdin.readline()
@@ -172,13 +288,103 @@ class BatchController:
             else:
                 click.echo("[*] Resuming...")
             logging.info("Resuming.")
+            _redraw_legend()
 
         if self._quit.is_set():
-            click.echo(f"\n[*] Soft quit: stopping cleanly after {processed_count}/{total} files.")
+            _erase_legend()
+            click.echo(f"\n[*] Soft quit: stopping cleanly after {processed_count}/{self._total} files.")
             logging.info(f"SOFT QUIT actioned after {processed_count} files.")
             return True
 
         return False
+
+
+# -----------------------------
+# Checkpoint helpers
+# -----------------------------
+_CHECKPOINT_FILE = "checkpoint.txt"
+
+def write_checkpoint(file_hash: str) -> None:
+    """Write the hash currently being processed to the checkpoint file.
+
+    Called *before* fetching/processing so that if the process crashes mid-file
+    the next run can detect the incomplete attempt.
+
+    :param file_hash: Hash about to be processed.
+    """
+    try:
+        with open(_CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+            f.write(file_hash + "\n")
+    except OSError:
+        pass
+
+def clear_checkpoint() -> None:
+    """Remove the checkpoint file after a file is successfully committed."""
+    try:
+        os.remove(_CHECKPOINT_FILE)
+    except OSError:
+        pass
+
+def check_stale_checkpoint() -> Optional[str]:
+    """Return the hash from a leftover checkpoint file, or None.
+
+    A leftover file means the previous run crashed mid-file.  The caller
+    decides whether to skip or retry that hash.
+
+    :returns: The stale hash string, or ``None`` if no checkpoint exists.
+    """
+    if os.path.exists(_CHECKPOINT_FILE):
+        try:
+            with open(_CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                h = f.read().strip()
+            return h if h else None
+        except OSError:
+            return None
+    return None
+
+
+# -----------------------------
+# Graceful Hydrus reconnect
+# -----------------------------
+def hydrus_get_with_reconnect(
+    client: hydrus_api.Client,
+    file_hash: str,
+    reconnect_retries: int = 5,
+    reconnect_delay: int = 30,
+) -> Any:
+    """Fetch a file, retrying on connection-level failures with a countdown.
+
+    Wraps :func:`get_file_with_retry` and adds an outer loop for the case
+    where Hydrus is temporarily unreachable (``requests`` raises a
+    ``ConnectionError`` / ``RuntimeError``).  Between attempts it counts
+    down visibly so the user knows the run is not frozen.
+
+    :param client: Hydrus API client.
+    :param file_hash: Hash to fetch.
+    :param reconnect_retries: How many times to attempt reconnection.
+    :param reconnect_delay: Seconds to wait between reconnection attempts.
+    :returns: The file response object.
+    :raises RuntimeError: If all reconnection attempts are exhausted.
+    """
+    for attempt in range(reconnect_retries):
+        try:
+            return get_file_with_retry(client, file_hash)
+        except (RuntimeError, OSError, ConnectionError) as e:
+            if attempt >= reconnect_retries - 1:
+                raise
+            for remaining in range(reconnect_delay, 0, -1):
+                sys.stdout.write(
+                    f"\r[!] Hydrus unreachable — retrying in {remaining:2d}s "
+                    f"(attempt {attempt + 1}/{reconnect_retries})  "
+                )
+                sys.stdout.flush()
+                time.sleep(1)
+            sys.stdout.write("\r" + " " * 70 + "\r")
+            sys.stdout.flush()
+            logging.warning(
+                f"Hydrus reconnect attempt {attempt + 1}/{reconnect_retries} for {file_hash}: {e}"
+            )
+    raise RuntimeError("Hydrus reconnect exhausted")  # unreachable but satisfies type-checker
 
 
 # -----------------------------
@@ -255,9 +461,12 @@ def cli():
               help="Hide tag output from cli")
 @click.option("--debug", is_flag=True, default=False,
               help="Show debug progress and pause before exit")
+@click.option("--max-files", default=0,
+              help="Stop after processing this many files (0 = no limit)")
 def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], token: str, cpu: bool,
                        model: str, threshold: float, host: str,
-                       tag_service: str, ratings_only: bool, privacy: bool, debug: bool) -> None:
+                       tag_service: str, ratings_only: bool, privacy: bool, debug: bool,
+                       max_files: int) -> None:
     """Evaluate a batch of single-frame images from Hydrus and add tags.
 
     This is the existing primary batch command: it either reads file hashes from
@@ -374,19 +583,31 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
 
     # -----------------------------
+    # Stale checkpoint check
+    # -----------------------------
+    counterh = 1
+    totalh = len(hashes)
+
+    def _show_idh(item) -> str:
+        return f"{counterh}/{totalh}"
+
+    stale = check_stale_checkpoint()
+    if stale:
+        click.echo(f"[!] WARNING: checkpoint.txt found — previous run may have crashed mid-file ({stale}).")
+        click.echo("    That hash will be retried this run. Delete checkpoint.txt to suppress this warning.")
+        logging.warning(f"Stale checkpoint detected: {stale}")
+
+    # -----------------------------
     # Processing Loop
     # -----------------------------
     processed_count = 0
     interrupted = False
 
-    controller = BatchController()
+    count_ref = [0]   # mutable ref so BatchController can read live value
+    controller = BatchController(total=totalh, processed_count_ref=count_ref)
 
-    counterh = 1
-    totalh = len(hashes)
-    
-    def _show_idh(item) -> str:
-        return f"{counterh}/{totalh}"
-
+    last_status_count = 0   # for periodic auto-status every 50 files
+    current_hash = ""
 
     try:
         with click.progressbar(hashes, item_show_func=_show_idh) as bar:
@@ -401,11 +622,22 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                 if not using_tag_search and file_hash in done_hashes:
                     continue
 
+                if max_files > 0 and processed_count >= max_files:
+                    _erase_legend()
+                    click.echo(f"\n[*] --max-files limit of {max_files} reached. Stopping.")
+                    logging.info(f"max-files limit {max_files} reached.")
+                    interrupted = True
+                    break
+
+                current_hash = file_hash
+                controller.reset_quit_frame_notification()
+                write_checkpoint(file_hash)
+
                 click.echo("\nprocessing: " + file_hash)
                 logging.info(f"Processing: {file_hash}")
 
                 try:
-                    response: Any = get_file_with_retry(client, file_hash)
+                    response: Any = hydrus_get_with_reconnect(client, file_hash)
 
                 except hydrus_api.APIError as e:
                     try:
@@ -422,6 +654,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                         bad_hashes.add(file_hash)
                         with open("bad-hashes.txt", "a", encoding="utf-8") as bad_f:
                             bad_f.write(file_hash + "\n")
+                        clear_checkpoint()
                         continue
                     else:
                         # real error, not a bad hash
@@ -443,6 +676,18 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                     bad_hashes.add(file_hash)
                     with open("bad-hashes.txt", "a", encoding="utf-8") as bad_f:
                         bad_f.write(file_hash + "\n")
+                    clear_checkpoint()
+                    continue
+
+                # --- Skip check (after fetch, before interrogate) ---
+                if controller.is_skip_requested():
+                    controller.clear_skip()
+                    image.close()
+                    clear_checkpoint()
+                    _erase_legend()
+                    click.echo(f"[>] Skipped: {file_hash}")
+                    logging.info(f"Skipped by user: {file_hash}")
+                    _redraw_legend()
                     continue
 
                 ratings: dict[str, float]
@@ -488,6 +733,8 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                 )
 
                 processed_count += 1
+                count_ref[0] = processed_count
+                clear_checkpoint()
 
                 # Only write done-hash if using hashfile mode
                 if not using_tag_search:
@@ -502,8 +749,13 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                     time.sleep(3)
                     logging.info(f"Processed {processed_count} files")
 
-                # --- Pause / soft-quit check ---
-                if controller.check(processed_count, totalh):
+                # --- Periodic auto-status every 50 files ---
+                if processed_count - last_status_count >= 50:
+                    last_status_count = processed_count
+                    controller.print_status(current_hash)
+
+                # --- Pause / skip / status / soft-quit check ---
+                if controller.check(processed_count, current_hash):
                     interrupted = True
                     break
 
@@ -600,7 +852,7 @@ def process_frames_streaming(
                 small.close()
                 img.close()
                 if controller is not None:
-                    controller.check_pause()
+                    controller.check_pause(file_hash)
                 continue
 
             # Frame is being kept/tagged
@@ -638,7 +890,7 @@ def process_frames_streaming(
             img.close()
 
             if controller is not None:
-                controller.check_pause()
+                controller.check_pause(file_hash)
 
 
     if last_small is not None:
@@ -839,9 +1091,12 @@ def ffmpeg_frame_gen(data: bytes, h: str, tmp_dir: Path, ffmpeg_exe):
               help="Hide tag output from cli")
 @click.option("--debug", is_flag=True, default=False,
               help="Show debug progress for video processing")
+@click.option("--max-files", default=0,
+              help="Stop after processing this many files (0 = no limit)")
 def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...], token: str, cpu: bool,
                              model: str, threshold: float, host: str,
-                             tag_service: str, ratings_only: bool, privacy: bool, debug: bool) -> None:
+                             tag_service: str, ratings_only: bool, privacy: bool, debug: bool,
+                             max_files: int) -> None:
     """Evaluate a batch of multi-frame content (GIF/video) and apply tags with RAM optimization.
 
     This command is similar to :func:`evaluate_api_batch` but targets
@@ -961,17 +1216,29 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
     "none": 0
     }
 
+    counterh = 0
+    totalh = len(hashes)
+
+    def _show_idh(item) -> str:
+        return f"{counterh}/{totalh} Done"
+
+    # -----------------------------
+    # Stale checkpoint check
+    # -----------------------------
+    stale = check_stale_checkpoint()
+    if stale:
+        click.echo(f"[!] WARNING: checkpoint.txt found — previous run may have crashed mid-file ({stale}).")
+        click.echo("    That hash will be retried this run. Delete checkpoint.txt to suppress this warning.")
+        logging.warning(f"Stale checkpoint detected: {stale}")
 
     processed_count = 0
     interrupted = False
 
-    controller = BatchController()
+    count_ref = [0]
+    controller = BatchController(total=totalh, processed_count_ref=count_ref)
 
-    counterh = 0
-    totalh = len(hashes)
-    
-    def _show_idh(item) -> str:
-        return f"{counterh}/{totalh} Done"
+    last_status_count = 0
+    current_hash = ""
 
     try:
         with click.progressbar(hashes, item_show_func=_show_idh) as bar:
@@ -986,6 +1253,17 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 if not using_tag_search and file_hash in done_hashes:
                     continue
 
+                if max_files > 0 and processed_count >= max_files:
+                    _erase_legend()
+                    click.echo(f"\n[*] --max-files limit of {max_files} reached. Stopping.")
+                    logging.info(f"max-files limit {max_files} reached.")
+                    interrupted = True
+                    break
+
+                current_hash = file_hash
+                controller.reset_quit_frame_notification()
+                write_checkpoint(file_hash)
+
                 # -----------------------------
                 # File metadata
                 # -----------------------------
@@ -994,16 +1272,14 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 except hydrus_api.APIError as e:
                     logging.warning(f"Metadata fetch failed for {file_hash}: {e}")
                     click.echo(f"  Skipping {file_hash}: metadata fetch failed.")
+                    clear_checkpoint()
                     continue
                 metadata_frames = metadata[0].get('num_frames') or 0
                 metadata_video_duration = metadata[0].get('duration') or 0
                 metadata_width = metadata[0].get('width') or 0
                 metadata_height = metadata[0].get('height') or 0
 
-
-
                 similarity_threshold_ff = dynamic_threshold(metadata_frames, metadata_video_duration, metadata_width, metadata_height)
-
 
                 if metadata_frames:
                     click.echo(f"\n  Processing {metadata_frames} frames for hash {file_hash}")
@@ -1013,12 +1289,20 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 else:
                     click.echo(f"\n  Warning: {file_hash} has no frame metadata. Processing with fallback threshold {similarity_threshold_ff:.2f}.")
                     logging.warning(f"{file_hash}: no frame metadata, using fallback threshold {similarity_threshold_ff:.2f}")
-                    # still process it, ffmpeg will extract what it can
 
+                # --- Skip check (before expensive fetch) ---
+                if controller.is_skip_requested():
+                    controller.clear_skip()
+                    clear_checkpoint()
+                    _erase_legend()
+                    click.echo(f"[>] Skipped: {file_hash}")
+                    logging.info(f"Skipped by user: {file_hash}")
+                    _redraw_legend()
+                    continue
 
                 try:
                     click.echo(f"  [INFO] Fetching video from Hydrus")
-                    response: Any = get_file_with_retry(client, file_hash)
+                    response: Any = hydrus_get_with_reconnect(client, file_hash)
 
                 except hydrus_api.APIError as e:
                     info = e.response.json()
@@ -1032,6 +1316,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                         bad_hashes.add(file_hash)
                         with open("bad-hashes.txt", "a", encoding="utf-8") as bad_f:
                             bad_f.write(file_hash + "\n")
+                        clear_checkpoint()
                         continue
                     else:
                         raise
@@ -1042,26 +1327,22 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     logging.error("Hydrus seems unreachable — stopping batch.")
                     raise
 
-
                 click.echo("  [INFO] Preparation complete.")
 
                 content = response.content
                 try:
                     test_img = Image.open(BytesIO(content))
-                    # check it actually has frames before committing to PIL path
                     n_frames = getattr(test_img, "n_frames", 1)
                     test_img.close()
                     if n_frames > 1:
                         frame_gen = pil_frame_gen(content)
                         del content
                     else:
-                        # single-frame PIL image — ffmpeg will handle better
                         frame_gen = ffmpeg_frame_gen(content, file_hash, repo_tmp_dir, ffmpeg_exe)
                         del content
                 except UnidentifiedImageError:
                     frame_gen = ffmpeg_frame_gen(content, file_hash, repo_tmp_dir, ffmpeg_exe)
                     del content
-
 
                 agg_scores, agg_ratings, kept_frames, total_frames = process_frames_streaming(
                     frame_generator=frame_gen,
@@ -1075,17 +1356,25 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     controller=controller,
                 )
 
-
                 click.echo(f"tagged {kept_frames} of {total_frames} frames")
                 logging.info(f"tagged {kept_frames} of {total_frames} frames")
                 click.echo()
 
+                # --- Skip check (after frame processing, before tag write) ---
+                if controller.is_skip_requested():
+                    controller.clear_skip()
+                    clear_checkpoint()
+                    _erase_legend()
+                    click.echo(f"[>] Skipped (post-frames): {file_hash}")
+                    logging.info(f"Skipped by user post-frames: {file_hash}")
+                    _redraw_legend()
+                    continue
 
                 if kept_frames == 0:
                     logging.warning(f"Skipping tag write for {file_hash}: no frames were tagged.")
                     click.echo(f"  [WARN] Skipping: no frames tagged for {file_hash}.")
+                    clear_checkpoint()
                     continue
-
 
                 rating = "none"
                 if modelinfo['ratingsflag']:
@@ -1093,7 +1382,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     for r, score in agg_ratings.items():
                         if score > threshold and rating_priority.get(r, 0) > rating_priority.get(rating, 0):
                             rating = r
-
 
                 if not ratings_only:
                     clipped_tags = [k.replace("_", " ") if k not in kaomojis else k for k in agg_scores]
@@ -1118,8 +1406,9 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     service_names_to_tags={tag_service: clipped_tags})
 
                 processed_count += 1
+                count_ref[0] = processed_count
                 gc.collect()
-
+                clear_checkpoint()
 
                 if not using_tag_search:
                     done_hashes.add(file_hash)
@@ -1132,8 +1421,13 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                     time.sleep(3)
                     logging.info(f"Processed {processed_count} files")
 
-                # --- Pause / soft-quit check ---
-                if controller.check(processed_count, totalh):
+                # --- Periodic auto-status every 25 files (video batches are smaller) ---
+                if processed_count - last_status_count >= 25:
+                    last_status_count = processed_count
+                    controller.print_status(current_hash)
+
+                # --- Pause / skip / status / soft-quit check ---
+                if controller.check(processed_count, current_hash):
                     interrupted = True
                     break
 
