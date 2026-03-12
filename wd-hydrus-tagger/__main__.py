@@ -849,6 +849,8 @@ def process_frames_streaming(
     last_small: Optional[PILImage] = None
     kept_count = 0
     total_count = 0
+    last_status_frame = 0
+    _FRAME_STATUS_INTERVAL = 500
 
     # Mutable refs so BatchController.print_status can read live frame progress
     kept_ref  = [0]
@@ -921,6 +923,12 @@ def process_frames_streaming(
             img.close()
 
             if controller is not None:
+                if total_count - last_status_frame >= _FRAME_STATUS_INTERVAL:
+                    last_status_frame = total_count
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    controller.print_status(file_hash)
+                    click.echo(_LEGEND)
                 if controller.check_pause(file_hash):
                     break   # skip requested mid-frame — exit generator loop
 
