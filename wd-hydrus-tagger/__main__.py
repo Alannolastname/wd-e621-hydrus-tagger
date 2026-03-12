@@ -236,7 +236,7 @@ class BatchController:
         if self._in_frames:
             fk = self._frame_kept_ref[0]
             ft = self._frame_total_ref[0]
-            fm = getattr(self, '_frame_total_meta', 0)   # set by process_frames_streaming
+            fm = getattr(self, '_frame_total_meta', 0)
             f_elapsed = time.monotonic() - self._frame_start_time
             f_rate    = ft / f_elapsed if f_elapsed > 0 else 0.0
             f_remaining = max(fm - ft, 0) if fm else 0
@@ -426,9 +426,25 @@ def hydrus_get_with_reconnect(
     raise RuntimeError("Hydrus reconnect exhausted")  # unreachable but satisfies type-checker
 
 
-# -----------------------------
-# Retry wrapper
-# -----------------------------
+def hydrus_call_with_reconnect(fn, *args, reconnect_retries: int = 5, reconnect_delay: int = 30, label: str = "Hydrus call", **kwargs) -> Any:
+    """Call any Hydrus API function, retrying on connection failures with a countdown."""
+    for attempt in range(reconnect_retries):
+        try:
+            return fn(*args, **kwargs)
+        except (RuntimeError, OSError, ConnectionError) as e:
+            if attempt >= reconnect_retries - 1:
+                raise
+            for remaining in range(reconnect_delay, 0, -1):
+                sys.stdout.write(
+                    f"\r[!] Hydrus unreachable ({label}) — retrying in {remaining:2d}s "
+                    f"(attempt {attempt + 1}/{reconnect_retries})  "
+                )
+                sys.stdout.flush()
+                time.sleep(1)
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.flush()
+            logging.warning(f"Hydrus reconnect attempt {attempt + 1}/{reconnect_retries} ({label}): {e}")
+    raise RuntimeError("Hydrus reconnect exhausted")
 def get_file_with_retry(client: hydrus_api.Client, file_hash: str, retries: int = 5, delay: int = 5) -> Any:
     """Fetch a file from a Hydrus server with retry semantics.
 
@@ -584,9 +600,12 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
         # Build a tag list: search tags + system predicate exclusions
         query_tags: list[str] = list(search_tag) + ["system:filetype is not ugoira, video"]
-        client.search_files(tags=query_tags)  # warm up the search to avoid first-query lag
-        
-        hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=2))
+        click.echo("[INFO] Connecting to Hydrus and searching for files...")
+        hashes: list[str] = cast(list[str], hydrus_call_with_reconnect(
+            client.search_files,
+            tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=2,
+            label="search_files",
+        ))
 
 
         click.echo(f"Found {len(hashes)} files (excluding ugoira and video).")
@@ -767,9 +786,11 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                         modelinfo['modelname'] + " ai generated tags"
                     )
 
-                client.add_tags(
+                hydrus_call_with_reconnect(
+                    client.add_tags,
                     hashes=[file_hash],
-                    service_names_to_tags={tag_service: clipped_tags} # pyright: ignore[reportCallIssue]
+                    service_names_to_tags={tag_service: clipped_tags}, # pyright: ignore[reportCallIssue]
+                    label="add_tags",
                 )
 
                 processed_count += 1
@@ -1224,11 +1245,12 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
         logging.info(f"Search Tags: {search_tag}")
         # Include only animated/video types not images
         query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video"]
-
-
-        client.search_files(tags=query_tags)
-        hashes: list[str] = cast(list[str], client.search_files(tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=16))
-        # sort type 16 is "system:number of frames", which should help with processing efficiency by front-loading shorter videos.
+        click.echo("[INFO] Connecting to Hydrus and searching for files...")
+        hashes: list[str] = cast(list[str], hydrus_call_with_reconnect(
+            client.search_files,
+            tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=16,
+            label="search_files",
+        ))
 
         click.echo(f"Found {len(hashes)} files (animated/video).")
         logging.info(f"Found {len(hashes)} files via tag search")
@@ -1316,7 +1338,11 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 # File metadata
                 # -----------------------------
                 try:
-                    metadata = client.get_file_metadata(hashes=[file_hash])
+                    metadata = hydrus_call_with_reconnect(
+                        client.get_file_metadata,
+                        hashes=[file_hash],
+                        label="get_file_metadata",
+                    )
                 except hydrus_api.APIError as e:
                     logging.warning(f"Metadata fetch failed for {file_hash}: {e}")
                     click.echo(f"  Skipping {file_hash}: metadata fetch failed.")
@@ -1449,9 +1475,12 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 else:
                     clipped_tags.append(f"{modelinfo['modelname']} ai generated tags")
 
-                client.add_tags(
-                    hashes=[file_hash], 
-                    service_names_to_tags={tag_service: clipped_tags})
+                hydrus_call_with_reconnect(
+                    client.add_tags,
+                    hashes=[file_hash],
+                    service_names_to_tags={tag_service: clipped_tags},
+                    label="add_tags",
+                )
 
                 processed_count += 1
                 count_ref[0] = processed_count
