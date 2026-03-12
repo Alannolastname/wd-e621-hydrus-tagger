@@ -80,16 +80,15 @@ _LEGEND = (
 )
 
 def _draw_legend() -> None:
-    """Print the sticky legend on its own line (stderr, does not interfere with
-    Click's stdout progressbar).  Only called reactively — never at startup —
-    so it always appears directly below the last output line."""
-    sys.stderr.write(f"\033[2K{_LEGEND}\n")
-    sys.stderr.flush()
+    """Print the legend on its own line (stdout, same stream as the frame
+    progress line so cursor navigation between them works correctly)."""
+    sys.stdout.write(f"\033[2K{_LEGEND}\n")
+    sys.stdout.flush()
 
 def _erase_legend() -> None:
-    """Move up one line and erase it (removes the legend before new output)."""
-    sys.stderr.write("\033[1A\033[2K")
-    sys.stderr.flush()
+    """Move up one line and erase it (removes a single legend line)."""
+    sys.stdout.write("\033[1A\033[2K")
+    sys.stdout.flush()
 
 def _redraw_legend() -> None:
     _draw_legend()
@@ -137,7 +136,7 @@ class BatchController:
         # Frame-level progress refs — set by process_frames_streaming
         self._frame_kept_ref:  list = [0]
         self._frame_total_ref: list = [0]
-        self._in_frames = False             # True while inside frame loop
+        self._in_frames = False
         self.start_time = time.monotonic()
         self._thread  = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
@@ -145,9 +144,11 @@ class BatchController:
     # ------------------------------------------------------------------
     # Called by process_frames_streaming to share its counters
     # ------------------------------------------------------------------
-    def attach_frame_refs(self, kept_ref: list, total_ref: list) -> None:
-        self._frame_kept_ref  = kept_ref
-        self._frame_total_ref = total_ref
+    def attach_frame_refs(self, kept_ref: list, total_ref: list, metadata_frames: int = 0) -> None:
+        self._frame_kept_ref   = kept_ref
+        self._frame_total_ref  = total_ref
+        self._frame_total_meta = metadata_frames
+        self._frame_start_time = time.monotonic()
         self._in_frames = True
 
     def detach_frame_refs(self) -> None:
@@ -235,7 +236,23 @@ class BatchController:
         if self._in_frames:
             fk = self._frame_kept_ref[0]
             ft = self._frame_total_ref[0]
-            frame_line = f"│  Frames   : {ft} processed  {fk} tagged\n"
+            fm = getattr(self, '_frame_total_meta', 0)   # set by process_frames_streaming
+            f_elapsed = time.monotonic() - self._frame_start_time
+            f_rate    = ft / f_elapsed if f_elapsed > 0 else 0.0
+            f_remaining = max(fm - ft, 0) if fm else 0
+            f_eta_secs  = f_remaining / f_rate if f_rate > 0 else 0.0
+            f_elapsed_str = time.strftime("%H:%M:%S", time.gmtime(f_elapsed))
+            f_eta_str     = time.strftime("%H:%M:%S", time.gmtime(f_eta_secs)) if f_rate > 0 else "--:--:--"
+            frame_line = (
+                f"│  ┌ Frames  : {ft}/{fm}  tagged {fk}\n"
+                f"│  │ Elapsed : {f_elapsed_str}    ETA : {f_eta_str}\n"
+                f"│  └ Rate    : {f_rate:.1f} frames/s  ({f_rate*3600:.0f} frames/hr)\n"
+            )
+
+        if self._in_frames:
+            current_line = f"│  Current  : (processing frames)\n"
+        else:
+            current_line = f"│  Current  : {current_hash or '(between files)'}\n"
 
         _erase_legend()
         click.echo(
@@ -243,7 +260,7 @@ class BatchController:
             f"│  Progress : {done}/{total} files\n"
             f"│  Elapsed  : {elapsed_str}    ETA : {eta_str}\n"
             f"│  Rate     : {rate:.1f} files/s  ({rate*3600:.0f} files/hr)\n"
-            f"│  Current  : {current_hash or '(between files)'}\n"
+            f"{current_line}"
             f"{frame_line}"
             f"│  Quit     : {quit_flag}   Skip : {skip_flag}   Pause : {pause_flag}\n"
             f"└───────────────────────────────────────────────"
@@ -269,10 +286,8 @@ class BatchController:
         :returns: ``True`` if skip was requested and the frame loop should stop.
         """
         if self._pause.is_set():
-            _erase_legend()
             click.echo("\n[*] Paused mid-frame. Press 'p'+Enter to resume...")
             logging.info("PAUSED mid-frame.")
-            # Block until listener sets _resume via 'p'+Enter
             self._resume.wait()
             self._resume.clear()
             self._pause.clear()
@@ -281,7 +296,7 @@ class BatchController:
             else:
                 click.echo("[*] Resuming frames...")
             logging.info("Resuming frames.")
-            _redraw_legend()
+            click.echo(_LEGEND)
 
         elif self._quit.is_set():
             # Just log — _listen already printed the message on key press
@@ -846,20 +861,21 @@ def process_frames_streaming(
     kept_ref  = [0]
     total_ref = [0]
     if controller is not None:
-        controller.attach_frame_refs(kept_ref, total_ref)
+        controller.attach_frame_refs(kept_ref, total_ref, metadata_frames)
+
+    click.echo(_LEGEND)
 
     try:
         for img in frame_generator:
             total_count += 1
             total_ref[0] = total_count
 
-            # In-place progress line — we own this cursor row entirely
-            pct = int(total_count / metadata_frames * 100) if metadata_frames else 0
+            pct        = int(total_count / metadata_frames * 100) if metadata_frames else 0
             bar_filled = int(pct / 2)
-            bar_str = "#" * bar_filled + "-" * (50 - bar_filled)
+            bar_str    = "#" * bar_filled + "-" * (50 - bar_filled)
             sys.stdout.write(
                 f"\r  [{bar_str}] {pct:3d}%  "
-                f"Frame:{total_count}/{metadata_frames}  Tagged:{kept_count}  "
+                f"Frame:{total_count}/{metadata_frames}  Tagged:{kept_count}\033[K"
             )
             sys.stdout.flush()
 
@@ -916,7 +932,6 @@ def process_frames_streaming(
                 if controller.check_pause(file_hash):
                     break   # skip requested mid-frame — exit generator loop
 
-        # Finish the progress line cleanly
         sys.stdout.write("\n")
         sys.stdout.flush()
 
