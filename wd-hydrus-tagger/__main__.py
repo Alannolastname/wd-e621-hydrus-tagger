@@ -69,6 +69,14 @@ kaomojis: list[str] = [
     "||_||",
 ]
 
+_RATING_PRIORITY: dict[str, int] = {
+    "explicit": 4,
+    "questionable": 3,
+    "sensitive": 2,
+    "general": 1,
+    "none": 0,
+}
+
 
 # -----------------------------
 # Pause / Soft-quit controller
@@ -129,13 +137,14 @@ class BatchController:
         self._resume  = threading.Event()   # set by listener to unblock pause
         self._quit    = threading.Event()
         self._skip    = threading.Event()
-        self._status  = threading.Event()
         self._lock    = threading.Lock()
         self._total   = total
         self._count_ref = processed_count_ref
         # Frame-level progress refs — set by process_frames_streaming
         self._frame_kept_ref:  list = [0]
         self._frame_total_ref: list = [0]
+        self._frame_total_meta: int = 0
+        self._frame_start_time: float = 0.0
         self._in_frames = False
         self.start_time = time.monotonic()
         self._thread  = threading.Thread(target=self._listen, daemon=True)
@@ -385,47 +394,6 @@ def check_stale_checkpoint() -> Optional[str]:
 # -----------------------------
 # Graceful Hydrus reconnect
 # -----------------------------
-def hydrus_get_with_reconnect(
-    client: hydrus_api.Client,
-    file_hash: str,
-    reconnect_retries: int = 5,
-    reconnect_delay: int = 30,
-) -> Any:
-    """Fetch a file, retrying on connection-level failures with a countdown.
-
-    Wraps :func:`get_file_with_retry` and adds an outer loop for the case
-    where Hydrus is temporarily unreachable (``requests`` raises a
-    ``ConnectionError`` / ``RuntimeError``).  Between attempts it counts
-    down visibly so the user knows the run is not frozen.
-
-    :param client: Hydrus API client.
-    :param file_hash: Hash to fetch.
-    :param reconnect_retries: How many times to attempt reconnection.
-    :param reconnect_delay: Seconds to wait between reconnection attempts.
-    :returns: The file response object.
-    :raises RuntimeError: If all reconnection attempts are exhausted.
-    """
-    for attempt in range(reconnect_retries):
-        try:
-            return get_file_with_retry(client, file_hash)
-        except (RuntimeError, OSError, ConnectionError) as e:
-            if attempt >= reconnect_retries - 1:
-                raise
-            for remaining in range(reconnect_delay, 0, -1):
-                sys.stdout.write(
-                    f"\r[!] Hydrus unreachable — retrying in {remaining:2d}s "
-                    f"(attempt {attempt + 1}/{reconnect_retries})  "
-                )
-                sys.stdout.flush()
-                time.sleep(1)
-            sys.stdout.write("\r" + " " * 70 + "\r")
-            sys.stdout.flush()
-            logging.warning(
-                f"Hydrus reconnect attempt {attempt + 1}/{reconnect_retries} for {file_hash}: {e}"
-            )
-    raise RuntimeError("Hydrus reconnect exhausted")  # unreachable but satisfies type-checker
-
-
 def hydrus_call_with_reconnect(fn, *args, reconnect_retries: int = 5, reconnect_delay: int = 30, label: str = "Hydrus call", **kwargs) -> Any:
     """Call any Hydrus API function, retrying on connection failures with a countdown."""
     for attempt in range(reconnect_retries):
@@ -445,6 +413,8 @@ def hydrus_call_with_reconnect(fn, *args, reconnect_retries: int = 5, reconnect_
             sys.stdout.flush()
             logging.warning(f"Hydrus reconnect attempt {attempt + 1}/{reconnect_retries} ({label}): {e}")
     raise RuntimeError("Hydrus reconnect exhausted")
+
+
 def get_file_with_retry(client: hydrus_api.Client, file_hash: str, retries: int = 5, delay: int = 5) -> Any:
     """Fetch a file from a Hydrus server with retry semantics.
 
@@ -643,7 +613,7 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
     # -----------------------------
     # Stale checkpoint check
     # -----------------------------
-    counterh = 1
+    counterh = 0
     totalh = len(hashes)
 
     def _show_idh(item) -> str:
@@ -696,7 +666,9 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
                 logging.info(f"Processing: {file_hash}")
 
                 try:
-                    response: Any = hydrus_get_with_reconnect(client, file_hash)
+                    response: Any = hydrus_call_with_reconnect(
+                        get_file_with_retry, client, file_hash, label="get_file",
+                    )
 
                 except hydrus_api.APIError as e:
                     try:
@@ -883,8 +855,7 @@ def process_frames_streaming(
     total_ref = [0]
     if controller is not None:
         controller.attach_frame_refs(kept_ref, total_ref, metadata_frames)
-
-    click.echo(_LEGEND)
+        click.echo(_LEGEND)
 
     try:
         for img in frame_generator:
@@ -1135,6 +1106,10 @@ def ffmpeg_frame_gen(data: bytes, h: str, tmp_dir: Path, ffmpeg_exe):
             p.unlink()
         logging.info(f"[ffmpeg] Total frames extracted: {count}")
     finally:
+        # Clean up any frame files that weren't consumed (e.g. exception mid-loop)
+        for p in frames:
+            if p.exists():
+                p.unlink()
         if in_path.exists():
             in_path.unlink()
 
@@ -1276,15 +1251,6 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
         with open("bad-hashes.txt", "r", encoding="utf-8") as f:
             bad_hashes = {line.strip() for line in f if line.strip()}
 
-
-    rating_priority = {
-    "explicit": 4,
-    "questionable": 3,
-    "sensitive": 2,
-    "general": 1,
-    "none": 0
-    }
-
     counterh = 0
     totalh = len(hashes)
 
@@ -1376,7 +1342,9 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
 
                 try:
                     click.echo(f"  [INFO] Fetching video from Hydrus")
-                    response: Any = hydrus_get_with_reconnect(client, file_hash)
+                    response: Any = hydrus_call_with_reconnect(
+                        get_file_with_retry, client, file_hash, label="get_file",
+                    )
 
                 except hydrus_api.APIError as e:
                     info = e.response.json()
@@ -1454,7 +1422,7 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
                 if modelinfo['ratingsflag']:
                     agg_ratings.setdefault("none", 0.0)
                     for r, score in agg_ratings.items():
-                        if score > threshold and rating_priority.get(r, 0) > rating_priority.get(rating, 0):
+                        if score > threshold and _RATING_PRIORITY.get(r, 0) > _RATING_PRIORITY.get(rating, 0):
                             rating = r
 
                 if not ratings_only:
