@@ -147,6 +147,8 @@ class BatchController:
         self._frame_start_time: float = 0.0
         self._in_frames = False
         self.start_time = time.monotonic()
+        self._pause_start: float = 0.0
+        self._total_paused: float = 0.0
         self._thread  = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
 
@@ -228,7 +230,7 @@ class BatchController:
 
     def _print_status_now(self, current_hash: str = "") -> None:
         """Internal — may be called from listener thread or main thread."""
-        elapsed     = time.monotonic() - self.start_time
+        elapsed     = time.monotonic() - self.start_time - self._total_paused
         done        = self._count_ref[0]
         total       = self._total
         remaining   = total - done
@@ -295,9 +297,14 @@ class BatchController:
         :returns: ``True`` if skip was requested and the frame loop should stop.
         """
         if self._pause.is_set():
+            self._pause_start = time.monotonic()
             click.echo("\n[*] Paused mid-frame. Press 'p'+Enter to resume...")
             logging.info("PAUSED mid-frame.")
             self._resume.wait()
+            pause_duration = time.monotonic() - self._pause_start
+            self._total_paused += pause_duration
+            if self._in_frames:
+                self._frame_start_time += pause_duration
             self._resume.clear()
             self._pause.clear()
             if self._quit.is_set():
@@ -322,6 +329,7 @@ class BatchController:
         :returns: ``True`` if the loop should stop.
         """
         if self._pause.is_set():
+            self._pause_start = time.monotonic()
             _erase_legend()
             click.echo(
                 f"\n[*] Paused after {processed_count}/{self._total} files. "
@@ -329,6 +337,7 @@ class BatchController:
             )
             logging.info(f"PAUSED after {processed_count} files.")
             self._resume.wait()
+            self._total_paused += time.monotonic() - self._pause_start
             self._resume.clear()
             self._pause.clear()
             if self._quit.is_set():
@@ -928,7 +937,7 @@ def process_frames_streaming(
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     controller.print_status(file_hash)
-                    click.echo(_LEGEND)
+                    #click.echo(_LEGEND)
                 if controller.check_pause(file_hash):
                     break   # skip requested mid-frame — exit generator loop
 
