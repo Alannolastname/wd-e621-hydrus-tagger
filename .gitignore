@@ -4,6 +4,7 @@ wd_hydrus_tagger.egg-info/*
 dist/*
 .idea
 .vscode
+.vs
 ffmpeg
 ffmpeg_temp
 logs
