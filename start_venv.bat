@@ -1,2 +1,2 @@
-"%~dp0\venv\Scripts\activate.bat"
+"%~dp0\.venv\Scripts\activate.bat"
 pause
