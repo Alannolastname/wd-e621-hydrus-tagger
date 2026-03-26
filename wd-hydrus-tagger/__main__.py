@@ -573,19 +573,36 @@ def evaluate_api_batch(hashfile: Optional[str], search_tag: tuple[str, ...], tok
 
     if search_tag:
         using_tag_search = True
-        #click.echo(f"Searching Hydrus for tags: {search_tag}")
         logging.info(f"Search Tags: {search_tag}")
 
 
         # Build a tag list: search tags + system predicate exclusions
-        query_tags: list[str] = list(search_tag) + ["system:filetype is not ugoira, video"]
+        # parse any tag prefixed with "OR:" into a grouped list
+        def build_query_tags(search_tag: tuple[str, ...]) -> list:
+            or_groups: dict[str, list[str]] = {}
+            result: list = []
+            for tag in search_tag:
+                if tag.startswith("OR:"):
+                    or_groups.setdefault("0", []).append(tag[3:])
+                elif tag[:2] == "OR" and ":" in tag:
+                    key, _, value = tag.partition(":")
+                    or_groups.setdefault(key[2:], []).append(value)
+                else:
+                    result.append(tag)
+            for group in or_groups.values():
+                result.append(group)
+            # hard set filter
+            result.append("system:filetype is not ugoira, video")
+            return result
+
+        query_tags = build_query_tags(search_tag)
+
         click.echo("[INFO] Connecting to Hydrus and searching for files...")
         hashes: list[str] = cast(list[str], hydrus_call_with_reconnect(
             client.search_files,
             tags=query_tags, return_hashes=True, file_sort_asc=True, file_sort_type=2,
             label="search_files",
         ))
-
 
         click.echo(f"Found {len(hashes)} files (excluding ugoira and video).")
         logging.info(f"Found {len(hashes)} files via tag search")
@@ -1235,8 +1252,30 @@ def evaluate_api_batch_video(hashfile: Optional[str], search_tag: tuple[str, ...
     if search_tag:
         using_tag_search = True
         logging.info(f"Search Tags: {search_tag}")
+
+
         # Include only animated/video types not images
-        query_tags: list[str] = list(search_tag) + ["system:filetype is ugoira, video"]
+        # parse any tag prefixed with "OR:" into a grouped list
+        def build_query_tags(search_tag: tuple[str, ...]) -> list:
+            or_groups: dict[str, list[str]] = {}
+            result: list = []
+            for tag in search_tag:
+                if tag.startswith("OR:"):
+                    or_groups.setdefault("0", []).append(tag[3:])
+                elif tag[:2] == "OR" and ":" in tag:
+                    key, _, value = tag.partition(":")
+                    or_groups.setdefault(key[2:], []).append(value)
+                else:
+                    result.append(tag)
+            for group in or_groups.values():
+                result.append(group)
+            # hard set filter
+            result.append("system:filetype is ugoira, video")
+            return result
+
+        query_tags = build_query_tags(search_tag)
+
+
         click.echo("[INFO] Connecting to Hydrus and searching for files...")
         hashes: list[str] = cast(list[str], hydrus_call_with_reconnect(
             client.search_files,
